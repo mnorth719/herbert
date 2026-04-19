@@ -106,6 +106,25 @@ class TestPiperProvider:
         # Each successive sentence's TTFB should be monotonically nondecreasing
         assert state.per_sentence_ttfb_ms == sorted(state.per_sentence_ttfb_ms)
 
+    def test_sample_rate_readable_before_first_stream(self, tmp_path: Path) -> None:
+        """AudioOut.play() reads sample_rate before stream() fires; sidecar must cover it."""
+        voice_file = tmp_path / "voice.onnx"
+        voice_file.write_bytes(b"fake")
+        sidecar = tmp_path / "voice.onnx.json"
+        sidecar.write_text('{"audio": {"sample_rate": 22050}}')
+
+        p = PiperProvider(voice_file)
+        # No stream() yet — would have raised before the sidecar fix
+        assert p.sample_rate == 22050
+
+    def test_sample_rate_errors_helpfully_when_sidecar_missing(self, tmp_path: Path) -> None:
+        voice_file = tmp_path / "voice.onnx"
+        voice_file.write_bytes(b"fake")
+        # No sidecar next to it
+        p = PiperProvider(voice_file)
+        with pytest.raises(RuntimeError, match=r"fetch-models\.py"):
+            _ = p.sample_rate
+
     async def test_voice_load_is_once(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:

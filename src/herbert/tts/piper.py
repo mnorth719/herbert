@@ -13,6 +13,7 @@ the path is configured and we fail-loud if missing.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from collections.abc import AsyncIterator
@@ -28,6 +29,25 @@ class PiperVoiceMissingError(FileNotFoundError):
     """Raised when the configured Piper voice file does not exist."""
 
 
+def _read_sample_rate(voice_path: Path) -> int | None:
+    """Read the sample rate from a Piper voice's JSON sidecar without loading ONNX.
+
+    Piper voices ship `<voice>.onnx` + `<voice>.onnx.json`; the sidecar has an
+    `audio.sample_rate` field we can read synchronously. Returns None if the
+    sidecar isn't present — the full `PiperVoice.load` path will populate the
+    rate at first `stream()` call in that case.
+    """
+    sidecar = voice_path.with_suffix(voice_path.suffix + ".json")
+    if not sidecar.exists():
+        return None
+    try:
+        data = json.loads(sidecar.read_text())
+        return int(data["audio"]["sample_rate"])
+    except (KeyError, ValueError, json.JSONDecodeError):
+        log.warning("piper voice sidecar %s missing audio.sample_rate", sidecar)
+        return None
+
+
 class PiperProvider:
     """`TtsProvider` backed by a local Piper ONNX model."""
 
@@ -35,12 +55,21 @@ class PiperProvider:
         self._voice_path = voice_path
         self._voice: Any | None = None
         self._load_lock = asyncio.Lock()
-        self._sample_rate: int | None = None
+        # Parse the sample rate from the sidecar at construction time so
+        # callers (e.g. AudioOut.play) can read `sample_rate` before the
+        # first `stream()` triggers the ONNX load.
+        self._sample_rate: int | None = (
+            _read_sample_rate(voice_path) if voice_path.exists() else None
+        )
 
     @property
     def sample_rate(self) -> int:
         if self._sample_rate is None:
-            raise RuntimeError("piper voice has not been loaded yet; call stream() first")
+            raise RuntimeError(
+                f"piper voice sample rate unknown. "
+                f"Missing sidecar JSON at {self._voice_path.with_suffix(self._voice_path.suffix + '.json')}? "
+                "Re-run: uv run python scripts/fetch-models.py --voice en_US-lessac-medium"
+            )
         return self._sample_rate
 
     async def stream(
@@ -88,7 +117,9 @@ class PiperProvider:
                 )
             log.info("loading piper voice from %s", self._voice_path)
             self._voice = await asyncio.to_thread(self._load_voice)
-            self._sample_rate = self._voice.config.sample_rate
+            # Sidecar already set this at init; fall back to voice config if not.
+            if self._sample_rate is None:
+                self._sample_rate = self._voice.config.sample_rate
             log.info("piper voice loaded; sample_rate=%d", self._sample_rate)
 
     def _load_voice(self) -> Any:
