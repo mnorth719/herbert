@@ -1,0 +1,41 @@
+# Herbert config — copy to ~/.config/herbert/config.toml and edit.
+# Secrets (API keys, bearer tokens) live in ~/.herbert/secrets.env (0600), not here.
+
+# persona_path = "~/.herbert/persona.md"
+# secrets_path = "~/.herbert/secrets.env"
+# log_path     = "~/.herbert/herbert.log"
+
+[web]
+# Localhost-only by default. Set expose=true (or pass --expose) to bind to 0.0.0.0.
+# When exposed, a bearer token is required; scan the QR code at boot to connect.
+bind_host = "127.0.0.1"
+port = 8080
+expose = false
+
+[stt]
+# "whisper_cpp" (local, default, private) | "whisper_api" | "deepgram"
+provider = "whisper_cpp"
+model = "base.en-q5_1"
+# input_device_name = "USB Audio"  # substring match against sd.query_devices()
+
+[tts]
+# "elevenlabs" (streaming, default, character) | "piper" (local fallback) | "openai"
+provider = "elevenlabs"
+# voice_id = "..."                  # pick from ElevenLabs dashboard; lives in secrets.env too
+fallback_provider = "piper"
+# output_device_name = "USB Audio"
+
+[llm]
+model = "claude-haiku-4-5"
+max_tokens = 1024
+
+[logging]
+log_transcripts = true
+level = "INFO"
+
+[mcp]
+# v1 ships with no MCP servers enabled. v2 onward:
+# servers = [
+#   { name = "home-assistant", url = "https://...", type = "url" },
+# ]
+servers = []

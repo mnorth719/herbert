@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+*.egg
+build/
+dist/
+.venv/
+.python-version.local
+
+# uv
+.uv-cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Testing / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+.tox/
+
+# Herbert runtime
+/tmp/herbert-booted
+herbert-*.log
+herbert.log
+herbert.log.*
+
+# Local config and secrets (user-specific, live in ~/.herbert/ not repo)
+config/herbert.toml
+.env
+secrets.env
+
+# Frontend build artifacts
+frontend/node_modules/
+frontend/dist/
+src/herbert/web/static/*
+!src/herbert/web/static/.gitkeep
+
+# Models / voices (downloaded at install time; not committed)
+*.bin
+*.onnx
+*.onnx.json
+!tests/fixtures/**/*.bin
