@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
 from datetime import UTC, datetime
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from herbert.events import AsyncEventBus
 
 # Known secret patterns. Tuned to avoid false positives on short hyphenated words.
 _SECRET_PATTERNS: list[tuple[re.Pattern[str], str]] = [
@@ -83,8 +87,48 @@ class JsonFormatter(logging.Formatter):
         return json.dumps(payload, default=str)
 
 
-def setup_logging(log_path: Path, level: str = "INFO", backup_count: int = 7) -> logging.Logger:
-    """Initialize the root Herbert logger. Idempotent — callable multiple times safely."""
+class BusHandler(logging.Handler):
+    """Bridges stdlib logging records to the AsyncEventBus as `LogLine` events.
+
+    The bus drives the diagnostic-view log tail. Emission is best-effort: we
+    schedule `bus.publish` onto the running loop if one exists; if not, we
+    silently drop (can happen during early startup or in sync contexts).
+    """
+
+    def __init__(self, bus: AsyncEventBus, level: int = logging.INFO) -> None:
+        super().__init__(level=level)
+        self._bus = bus
+        # Always self-redact — this is the diagnostic-view pipe and must not leak secrets
+        self.addFilter(RedactingFilter())
+
+    def emit(self, record: logging.LogRecord) -> None:
+        from herbert.events import LogLine
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        line = self.format(record)
+        event = LogLine(
+            turn_id=getattr(record, "turn_id", None),
+            level=record.levelname,
+            line=line,
+        )
+        # Fire-and-forget: LogLine is best-effort plumbing, not critical path
+        loop.create_task(self._bus.publish(event))  # noqa: RUF006
+
+
+def setup_logging(
+    log_path: Path,
+    level: str = "INFO",
+    backup_count: int = 7,
+    bus: AsyncEventBus | None = None,
+) -> logging.Logger:
+    """Initialize the root Herbert logger. Idempotent — callable multiple times safely.
+
+    If `bus` is provided, a `BusHandler` is attached so log lines flow to the
+    event bus as `LogLine` events (drives the diagnostic-view log tail).
+    """
     log_path.parent.mkdir(parents=True, exist_ok=True)
     root = logging.getLogger("herbert")
     root.setLevel(level.upper())
@@ -104,6 +148,12 @@ def setup_logging(log_path: Path, level: str = "INFO", backup_count: int = 7) ->
     file_handler.setFormatter(JsonFormatter())
     file_handler.addFilter(redactor)
     root.addHandler(file_handler)
+
+    if bus is not None:
+        bus_handler = BusHandler(bus)
+        bus_handler.setFormatter(logging.Formatter("%(asctime)s  %(levelname)-5s  %(name)s  %(message)s"))
+        bus_handler.addFilter(redactor)
+        root.addHandler(bus_handler)
 
     root.propagate = False
     return root
