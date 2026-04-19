@@ -41,6 +41,9 @@ config/herbert.toml
 .env
 secrets.env
 
+# Claude Code local settings
+.claude/settings.local.json
+
 # Frontend build artifacts
 frontend/node_modules/
 frontend/dist/
