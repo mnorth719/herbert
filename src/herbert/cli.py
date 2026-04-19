@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import logging
 import sys
 from pathlib import Path
 
 from herbert import __version__
 from herbert.config import DEFAULT_CONFIG_PATH, HerbertConfig, load_config
+from herbert.events import AsyncEventBus
 from herbert.logging import setup_logging
 from herbert.secrets import MissingSecretError, ensure_frontend_bearer_token, load_secrets
 
@@ -66,8 +68,7 @@ def _run_dev(cfg: HerbertConfig, args: argparse.Namespace, logger: logging.Logge
         _config_source(args.config),
         cfg.log_path,
     )
-    # Daemon event loop lands in Unit 7; for Unit 1 we return after printing ready.
-    return 0
+    return _run_daemon(cfg)
 
 
 def _run_production(cfg: HerbertConfig, args: argparse.Namespace, logger: logging.Logger) -> int:
@@ -82,8 +83,19 @@ def _run_production(cfg: HerbertConfig, args: argparse.Namespace, logger: loggin
         _config_source(args.config),
         cfg.log_path,
     )
-    # Daemon event loop + kiosk launch land in Unit 7 + Unit 10.
-    return 0
+    return _run_daemon(cfg)
+
+
+def _run_daemon(cfg: HerbertConfig) -> int:
+    from herbert.daemon import build_and_run
+
+    bus = AsyncEventBus()
+    # Reattach logging with the bus so LogLine events flow to /ws in Unit 8+
+    setup_logging(log_path=cfg.log_path, level=cfg.logging.level, bus=bus)
+    try:
+        return asyncio.run(build_and_run(cfg, bus=bus))
+    except KeyboardInterrupt:
+        return 0
 
 
 def _check_required_secrets(cfg: HerbertConfig, logger: logging.Logger) -> None:

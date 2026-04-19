@@ -1,0 +1,332 @@
+"""Daemon orchestrator — wires HAL + STT + LLM + TTS + audio into a voice loop.
+
+This is the first real composition of every provider into a single running
+process. The shape:
+
+  event loop:
+    on PressStarted:
+      if a turn is mid-flight → cancel it (barge-in), reconcile session
+      start a new Turn task; transition idle → listening
+    on PressEnded:
+      set Turn.release_event so AudioIn stops capturing
+    (the Turn task handles thinking → speaking → idle by itself)
+
+Each Turn task:
+  1. Wait for AudioIn to drain (release_event fired by PressEnded)
+  2. transition listening → thinking
+  3. STT
+  4. If transcript non-empty: stream LLM sentences → TTS PCM → AudioOut.play()
+     transition thinking → speaking on the first TTS chunk
+  5. transition speaking → idle (or thinking → idle if no LLM output)
+
+Error handling: any exception inside the Turn task is classified and
+published as `ErrorOccurred`; the state machine transitions to `error`.
+Recovery from `error` happens on the next PressStarted (manual retry).
+Automatic retry for transient network errors is deferred to Unit 11 per
+plan R16 scope.
+
+Cancellation invariants (barge-in):
+- Cancelling the Turn task raises CancelledError at whatever await is
+  current (LLM generator, TTS generator, audio buffer write). Each
+  provider's finally-block / context-manager closes its connection
+  cleanly on the way out.
+- Session reconciliation post-cancel: if llm_state.tokens_received == 0
+  the user message is popped (keeps role alternation valid for next turn);
+  otherwise the partial assistant response is replaced with
+  "<partial> [interrupted]".
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from collections.abc import AsyncIterator
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from herbert.config import HerbertConfig
+from herbert.errors import classify_error
+from herbert.events import (
+    AsyncEventBus,
+    ErrorOccurred,
+    TranscriptDelta,
+    TurnCompleted,
+    TurnStarted,
+)
+from herbert.hal import AudioIn, AudioOut, EventSource, Hal, PressEnded, PressStarted
+from herbert.llm.claude import stream_turn
+from herbert.session import InMemorySession, Message, Session
+from herbert.state import StateMachine
+from herbert.stt import SttProvider
+from herbert.tts import TtsProvider
+from herbert.turn import Turn
+
+log = logging.getLogger(__name__)
+
+
+@dataclass
+class DaemonDeps:
+    """Everything the daemon needs, bundled for easy injection in tests."""
+
+    config: HerbertConfig
+    bus: AsyncEventBus
+    hal: Hal
+    stt: SttProvider
+    tts: TtsProvider
+    llm_client: Any  # anthropic.AsyncAnthropic or a stub
+    persona: str
+    mcp_servers: list[dict[str, str]] | None = None
+
+
+class Daemon:
+    """Coordinates event source, pipeline workers, and the state machine."""
+
+    def __init__(self, deps: DaemonDeps, session: Session | None = None) -> None:
+        self._deps = deps
+        self._state = StateMachine(deps.bus)
+        self._session: Session = session or InMemorySession()
+        self._current_turn: Turn | None = None
+        self._current_task: asyncio.Task[None] | None = None
+        self._stopping = asyncio.Event()
+
+    @property
+    def state(self) -> str:
+        return self._state.state
+
+    @property
+    def session(self) -> Session:
+        return self._session
+
+    async def run(self) -> None:
+        """Main loop. Consumes the event source until `stop()` fires."""
+        source: EventSource = self._deps.hal.event_source
+        log.info("daemon ready, listening for button events")
+        events = source.events()
+        try:
+            async for event in events:
+                if self._stopping.is_set():
+                    break
+                if isinstance(event, PressStarted):
+                    await self._on_press_started()
+                elif isinstance(event, PressEnded):
+                    self._on_press_ended()
+        finally:
+            await self._cancel_current_turn(reason="daemon shutdown")
+            await source.close()
+
+    async def stop(self) -> None:
+        self._stopping.set()
+        await self._cancel_current_turn(reason="stop requested")
+
+    # --- Event handlers ---------------------------------------------------
+
+    async def _on_press_started(self) -> None:
+        await self._cancel_current_turn(reason="barge-in")
+        turn = Turn()
+        self._current_turn = turn
+        await self._state.transition("listening", turn_id=turn.turn_id)
+        await self._deps.bus.publish(TurnStarted(turn_id=turn.turn_id, mode="mac_hybrid"))
+        self._current_task = asyncio.create_task(self._run_turn(turn))
+
+    def _on_press_ended(self) -> None:
+        if self._current_turn is not None:
+            self._current_turn.release_event.set()
+
+    async def _cancel_current_turn(self, *, reason: str) -> None:
+        task = self._current_task
+        turn = self._current_turn
+        if task is None or task.done():
+            return
+        log.info("cancelling active turn (%s)", reason)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            log.warning("turn task raised during cancel: %s", exc)
+        if turn is not None:
+            self._reconcile_session_after_cancel(turn)
+
+    def _reconcile_session_after_cancel(self, turn: Turn) -> None:
+        """Preserve the alternating-role invariant on the Session.
+
+        - 0 tokens received: the user message is the last entry → pop it.
+        - ≥1 token: the stream_turn path may or may not have appended the
+          assistant message yet. If the last message is the assistant's,
+          replace it with a trailing "[interrupted]" marker; if it's the
+          user's (assistant append never happened), replace the prior
+          user-only state with (user, interrupted-assistant) pair.
+        """
+        if not turn.llm_state.tokens_received:
+            last = self._session.messages[-1] if self._session.messages else None
+            if last is not None and last.role == "user" and last.content == turn.transcript:
+                self._session.pop_last()
+            return
+        partial = turn.llm_state.accumulated_text.strip()
+        if not partial:
+            return
+        marker = f"{partial} [interrupted]"
+        last = self._session.messages[-1] if self._session.messages else None
+        if last is not None and last.role == "assistant":
+            if hasattr(self._session, "replace_last"):
+                self._session.replace_last(Message(role="assistant", content=marker))  # type: ignore[attr-defined]
+        else:
+            self._session.append(Message(role="assistant", content=marker))
+
+    # --- Turn pipeline ----------------------------------------------------
+
+    async def _run_turn(self, turn: Turn) -> None:
+        """Drive STT → LLM → TTS → Playback for a single exchange."""
+        audio_in: AudioIn = self._deps.hal.audio_in
+        try:
+            pcm = await audio_in.capture_until_released(turn.release_event)
+            await self._state.transition("thinking", turn_id=turn.turn_id)
+            transcript = await self._run_stt(turn, pcm)
+            turn.transcript = transcript
+            if not transcript.strip():
+                log.info("empty transcript; skipping LLM call")
+                await self._state.transition("idle", turn_id=turn.turn_id)
+                await self._publish_turn_completed(turn, outcome="success")
+                return
+            await self._deps.bus.publish(
+                TranscriptDelta(turn_id=turn.turn_id, role="user", text=transcript)
+            )
+            await self._run_llm_and_speak(turn)
+            await self._state.transition("idle", turn_id=turn.turn_id)
+            await self._publish_turn_completed(turn, outcome="success")
+        except asyncio.CancelledError:
+            log.info("turn %s cancelled", turn.turn_id)
+            await self._publish_turn_completed(turn, outcome="cancelled")
+            raise
+        except Exception as exc:
+            await self._on_turn_error(turn, exc)
+
+    async def _run_stt(self, turn: Turn, pcm: bytes) -> str:
+        stt: SttProvider = self._deps.stt
+        sample_rate = self._deps.hal.audio_in.sample_rate
+        result = await stt.transcribe(pcm, sample_rate=sample_rate)
+        turn.span.record("stt", result.duration_ms)
+        return result.text
+
+    async def _run_llm_and_speak(self, turn: Turn) -> None:
+        tts: TtsProvider = self._deps.tts
+        audio_out: AudioOut = self._deps.hal.audio_out
+
+        sentences = stream_turn(
+            turn.transcript,
+            self._session,
+            self._deps.persona,
+            client=self._deps.llm_client,
+            model=self._deps.config.llm.model,
+            max_tokens=self._deps.config.llm.max_tokens,
+            mcp_servers=self._deps.mcp_servers,
+            state=turn.llm_state,
+        )
+
+        pcm_stream = tts.stream(sentences, state=turn.tts_state)
+        state = self._state  # local alias for the inner closure
+
+        async def _instrumented_pcm() -> AsyncIterator[bytes]:
+            first = True
+            async for chunk in pcm_stream:
+                if first:
+                    await state.transition("speaking", turn_id=turn.turn_id)
+                    first = False
+                yield chunk
+
+        await audio_out.play(_instrumented_pcm(), sample_rate=tts.sample_rate)
+        if turn.llm_state.ttft_ms is not None:
+            turn.span.record("llm_ttft", turn.llm_state.ttft_ms)
+        if turn.llm_state.first_sentence_ms is not None:
+            turn.span.record("first_sentence", turn.llm_state.first_sentence_ms)
+        if turn.tts_state.ttfb_ms is not None:
+            turn.span.record("tts_ttfb", turn.tts_state.ttfb_ms)
+
+    async def _on_turn_error(self, turn: Turn, exc: BaseException) -> None:
+        klass = classify_error(exc)
+        log.warning("turn %s failed: %s (class=%s)", turn.turn_id, exc, klass)
+        # Reconcile the session the same way cancellation does so a failed
+        # turn doesn't leave an orphan user message that breaks the
+        # user→assistant alternation on the next retry.
+        self._reconcile_session_after_cancel(turn)
+        await self._deps.bus.publish(
+            ErrorOccurred(turn_id=turn.turn_id, error_class=klass, message=str(exc))
+        )
+        await self._state.transition_to_error(turn_id=turn.turn_id)
+        await self._publish_turn_completed(turn, outcome="error")
+
+    async def _publish_turn_completed(self, turn: Turn, outcome: str) -> None:
+        await self._deps.bus.publish(
+            TurnCompleted(turn_id=turn.turn_id, outcome=outcome)  # type: ignore[arg-type]
+        )
+
+
+# --- Factory + CLI entry -----------------------------------------------------
+
+
+def _load_persona(path: Path) -> str:
+    if not path.exists():
+        return "You are Herbert, a retro-futurist home companion. Reply briefly."
+    return path.read_text()
+
+
+async def build_and_run(config: HerbertConfig, *, bus: AsyncEventBus) -> int:
+    """Wire up the live providers on the current platform and run the daemon.
+
+    This is the entry the CLI `dev` / `run` subcommands call into. For tests
+    that need a daemon bound to replay providers, construct `DaemonDeps`
+    directly and instantiate `Daemon` without going through this function.
+    """
+    from anthropic import AsyncAnthropic
+
+    from herbert.hal import build_hal, detect_platform
+    from herbert.llm.mcp_passthrough import build_mcp_servers
+    from herbert.secrets import load_secrets
+    from herbert.stt.whisper_cpp import WhisperCppProvider
+    from herbert.tts.elevenlabs_stream import ElevenLabsProvider
+    from herbert.tts.piper import PiperProvider
+
+    platform = detect_platform()
+    hal = build_hal(
+        platform,
+        input_device_name=config.stt.input_device_name,
+        output_device_name=config.tts.output_device_name,
+    )
+    secrets = load_secrets(config.secrets_path)
+
+    anthropic_key = secrets.require("ANTHROPIC_API_KEY")
+    import os as _os
+
+    _os.environ["ANTHROPIC_API_KEY"] = anthropic_key
+    llm_client = AsyncAnthropic()
+
+    if config.tts.provider == "elevenlabs":
+        eleven_key = secrets.require("ELEVENLABS_API_KEY")
+        voice_id = config.tts.voice_id or secrets.get("ELEVENLABS_VOICE_ID")
+        if not voice_id:
+            raise RuntimeError("ELEVENLABS_VOICE_ID not set in config or secrets")
+        tts: TtsProvider = ElevenLabsProvider(api_key=eleven_key, voice_id=voice_id)
+    elif config.tts.provider == "piper":
+        voice_path = Path.home() / ".herbert" / "voices" / "en_US-lessac-medium.onnx"
+        tts = PiperProvider(voice_path=voice_path)
+    else:
+        raise RuntimeError(f"unknown tts.provider {config.tts.provider!r}")
+
+    stt = WhisperCppProvider(
+        model_path=Path.home() / ".herbert" / "models" / "ggml-base.en-q5_1.bin"
+    )
+    deps = DaemonDeps(
+        config=config,
+        bus=bus,
+        hal=hal,
+        stt=stt,
+        tts=tts,
+        llm_client=llm_client,
+        persona=_load_persona(config.persona_path),
+        mcp_servers=build_mcp_servers(config.mcp) or None,
+    )
+    daemon = Daemon(deps)
+    await daemon.run()
+    return 0
