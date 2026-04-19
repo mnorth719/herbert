@@ -128,5 +128,12 @@ class PiperProvider:
         return PiperVoice.load(str(self._voice_path))
 
     def _synthesize(self, sentence: str) -> list[bytes]:
+        """Run Piper synthesize() and return raw int16 PCM chunks.
+
+        Piper's current API yields `AudioChunk` objects per sentence with
+        `.audio_int16_bytes` carrying the raw PCM. (Older piper-tts exposed
+        `synthesize_stream_raw` returning bytes directly; this wrapper keeps
+        the downstream contract stable across versions.)
+        """
         assert self._voice is not None
-        return list(self._voice.synthesize_stream_raw(sentence))
+        return [chunk.audio_int16_bytes for chunk in self._voice.synthesize(sentence)]

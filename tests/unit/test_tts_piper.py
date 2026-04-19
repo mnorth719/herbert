@@ -18,6 +18,11 @@ class _FakeConfig:
         self.sample_rate = sample_rate
 
 
+class _FakeChunk:
+    def __init__(self, pcm: bytes) -> None:
+        self.audio_int16_bytes = pcm
+
+
 class _FakeVoice:
     def __init__(self, sample_rate: int = 22050) -> None:
         self.config = _FakeConfig(sample_rate)
@@ -27,11 +32,11 @@ class _FakeVoice:
     def load(path: str) -> _FakeVoice:
         return _FakeVoice()
 
-    def synthesize_stream_raw(self, sentence: str):  # type: ignore[no-untyped-def]
+    def synthesize(self, sentence: str):  # type: ignore[no-untyped-def]
         self._calls.append(sentence)
         # Emit 2 chunks per sentence so per-chunk behavior is observable
-        yield b"A" * 1000
-        yield b"B" * 500
+        yield _FakeChunk(b"A" * 1000)
+        yield _FakeChunk(b"B" * 500)
 
 
 def _install_piper_stub(monkeypatch: pytest.MonkeyPatch) -> None:
