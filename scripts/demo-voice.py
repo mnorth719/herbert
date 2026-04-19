@@ -30,10 +30,13 @@ from pathlib import Path
 
 DEFAULT_MODEL = Path.home() / ".herbert" / "models" / "ggml-base.en-q5_1.bin"
 DEFAULT_PIPER_VOICE = Path.home() / ".herbert" / "voices" / "en_US-lessac-medium.onnx"
-DEFAULT_PERSONA = (
-    "You are Herbert, a retro-futurist home companion. Reply in one or two "
-    "short sentences — friendly, a little dry, not a lecture."
-)
+
+# Import the canonical persona so the demo reflects the same TTS-aware rules
+# the real daemon uses. Deferred until argparse completes to keep --help fast.
+def _default_persona() -> str:
+    from herbert.daemon import DEFAULT_PERSONA
+
+    return DEFAULT_PERSONA
 
 
 def _read_wav(path: Path) -> tuple[bytes, int]:
@@ -241,7 +244,7 @@ async def _main_async(args: argparse.Namespace) -> None:
 
     await _speak(
         transcript,
-        args.persona,
+        args.persona or _default_persona(),
         anthropic_key=anthropic,
         tts_backend=args.tts,
         eleven_key=eleven,
@@ -259,7 +262,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--model", default=str(DEFAULT_MODEL), help=f"Whisper model path (default: {DEFAULT_MODEL})")
     p.add_argument("--model-llm", default="claude-haiku-4-5", help="Claude model id")
-    p.add_argument("--persona", default=DEFAULT_PERSONA, help="System prompt")
+    p.add_argument("--persona", default=None, help="System prompt (default: herbert.daemon.DEFAULT_PERSONA)")
     p.add_argument(
         "--tts",
         choices=["elevenlabs", "piper"],
