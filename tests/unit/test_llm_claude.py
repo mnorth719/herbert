@@ -10,13 +10,58 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from typing import Any
 
+import pytest
+
 from herbert.llm.claude import LlmTurnState, stream_turn
 from herbert.session import InMemorySession, Message
 
 
+class _TextDeltaEvent:
+    """Mimics Anthropic's RawContentBlockDeltaEvent for a text_delta."""
+
+    type = "content_block_delta"
+
+    def __init__(self, text: str) -> None:
+        self.delta = _TextDelta(text)
+
+
+class _TextDelta:
+    type = "text_delta"
+
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+
+class _ToolUseStartEvent:
+    """Mimics Anthropic's RawContentBlockStartEvent for a server_tool_use."""
+
+    type = "content_block_start"
+
+    def __init__(self, block_type: str = "server_tool_use") -> None:
+        self.content_block = _ContentBlock(block_type)
+
+
+class _ContentBlock:
+    def __init__(self, block_type: str) -> None:
+        self.type = block_type
+
+
+def _text_events(deltas: list[str]) -> list[_TextDeltaEvent]:
+    return [_TextDeltaEvent(d) for d in deltas]
+
+
 class _StubStream:
-    def __init__(self, deltas: list[str]) -> None:
-        self._deltas = deltas
+    """Stream stub that iterates a scripted list of structured events.
+
+    Accepts either raw event objects (with .type) or bare strings (treated
+    as text deltas, for ergonomic per-test setup). When constructed from the
+    older deltas-only shape, converts on the way in.
+    """
+
+    def __init__(self, events_or_deltas: list[Any]) -> None:
+        self._events = [
+            e if hasattr(e, "type") else _TextDeltaEvent(e) for e in events_or_deltas
+        ]
         self.entered = False
 
     async def __aenter__(self) -> _StubStream:
@@ -26,11 +71,10 @@ class _StubStream:
     async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
         return None
 
-    @property
-    def text_stream(self) -> AsyncIterator[str]:
-        async def _gen() -> AsyncIterator[str]:
-            for d in self._deltas:
-                yield d
+    def __aiter__(self) -> AsyncIterator[Any]:
+        async def _gen() -> AsyncIterator[Any]:
+            for e in self._events:
+                yield e
 
         return _gen()
 
@@ -180,6 +224,69 @@ class TestMcpWiring:
         kwargs = client.messages.last_kwargs
         assert kwargs["mcp_servers"] == mcp
         assert kwargs["extra_headers"] == {"anthropic-beta": "mcp-client-2025-11-20"}
+
+
+class TestToolUseFiller:
+    async def test_tool_use_before_any_text_injects_filler(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When server_tool_use starts with zero prior text, we inject a covering sentence."""
+        from herbert.llm import claude as claude_mod
+
+        monkeypatch.setattr(claude_mod, "_pick_filler", lambda: "Let me check.")
+
+        session = InMemorySession()
+        # Event sequence: tool fires first, then result text arrives
+        client = _StubClient(
+            [
+                _ToolUseStartEvent(),
+                _TextDeltaEvent("The weather "),
+                _TextDeltaEvent("is 72 and clear."),
+            ]
+        )
+        sentences = await _collect(stream_turn("weather?", session, "p", client=client))
+        assert sentences == ["Let me check.", "The weather is 72 and clear."]
+
+    async def test_tool_use_after_text_does_not_inject(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """If Claude already emitted a covering sentence, don't double up."""
+        from herbert.llm import claude as claude_mod
+
+        monkeypatch.setattr(
+            claude_mod, "_pick_filler", lambda: "SHOULD_NOT_APPEAR."
+        )
+
+        session = InMemorySession()
+        client = _StubClient(
+            [
+                _TextDeltaEvent("One sec. "),
+                _ToolUseStartEvent(),
+                _TextDeltaEvent("It's 72."),
+            ]
+        )
+        sentences = await _collect(stream_turn("weather?", session, "p", client=client))
+        assert sentences == ["One sec.", "It's 72."]
+
+    async def test_multiple_tool_calls_only_first_injects(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from herbert.llm import claude as claude_mod
+
+        monkeypatch.setattr(claude_mod, "_pick_filler", lambda: "Looking.")
+
+        session = InMemorySession()
+        # Two server tool calls; we only cover the very first one
+        client = _StubClient(
+            [
+                _ToolUseStartEvent(),
+                _TextDeltaEvent("In Pasadena "),
+                _ToolUseStartEvent(),
+                _TextDeltaEvent("it is 72."),
+            ]
+        )
+        sentences = await _collect(stream_turn("weather?", session, "p", client=client))
+        assert sentences == ["Looking.", "In Pasadena it is 72."]
 
 
 class TestCancellation:

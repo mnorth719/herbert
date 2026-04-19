@@ -16,12 +16,13 @@ def test_build_tools_enabled_includes_web_search() -> None:
     assert tools[0]["name"] == "web_search"
 
 
-def test_persona_addendum_instructs_ack_before_search() -> None:
-    # Regression guard: the addendum's whole point is telling Claude to
-    # emit a covering sentence before the tool fires. If this string drops,
-    # the UX regresses to dead-air waits.
+def test_persona_addendum_forbids_claude_owned_acknowledgement() -> None:
+    # Regression guard: the local filler in claude.py is the canonical
+    # covering phrase. If the addendum ever tells Claude to add its own
+    # again we get duplicates ("let me check. just a moment. <answer>").
     addendum = WEB_SEARCH_PERSONA_ADDENDUM.lower()
-    assert "acknowledgement" in addendum
+    assert "do not" in addendum or "don't" in addendum
+    assert "covering sentence" in addendum or "filler" in addendum
     assert "before calling web_search" in addendum or "before calling the tool" in addendum
 
 

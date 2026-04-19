@@ -58,6 +58,20 @@ class LlmDelta:
     error: BaseException | None = None
 
 
+class _ReplayTextDelta:
+    type = "text_delta"
+
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+
+class _ReplayDeltaEvent:
+    type = "content_block_delta"
+
+    def __init__(self, text: str) -> None:
+        self.delta = _ReplayTextDelta(text)
+
+
 class _ReplayStream:
     def __init__(self, script: list[LlmDelta]) -> None:
         self._script = script
@@ -68,11 +82,10 @@ class _ReplayStream:
     async def __aexit__(self, *args: Any) -> None:
         return None
 
-    @property
-    def text_stream(self) -> AsyncIterator[str]:
+    def __aiter__(self) -> AsyncIterator[Any]:
         script = self._script
 
-        async def _gen() -> AsyncIterator[str]:
+        async def _gen() -> AsyncIterator[Any]:
             loop = asyncio.get_running_loop()
             start = loop.time()
             for step in script:
@@ -83,7 +96,7 @@ class _ReplayStream:
                 if step.error is not None:
                     raise step.error
                 if step.text:
-                    yield step.text
+                    yield _ReplayDeltaEvent(step.text)
 
         return _gen()
 

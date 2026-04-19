@@ -43,9 +43,25 @@ class _StubStt:
         return SttResult(text=self._text, duration_ms=self._duration_ms)
 
 
+class _TextDelta:
+    type = "text_delta"
+
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+
+class _DeltaEvent:
+    """Mimics Anthropic's RawContentBlockDeltaEvent(text_delta)."""
+
+    type = "content_block_delta"
+
+    def __init__(self, text: str) -> None:
+        self.delta = _TextDelta(text)
+
+
 class _StubStream:
     def __init__(self, deltas: list[str]) -> None:
-        self._deltas = deltas
+        self._events = [_DeltaEvent(d) for d in deltas]
 
     async def __aenter__(self) -> _StubStream:
         return self
@@ -53,12 +69,11 @@ class _StubStream:
     async def __aexit__(self, *args: Any) -> None:
         return None
 
-    @property
-    def text_stream(self) -> AsyncIterator[str]:
-        async def _gen() -> AsyncIterator[str]:
-            for d in self._deltas:
+    def __aiter__(self) -> AsyncIterator[Any]:
+        async def _gen() -> AsyncIterator[Any]:
+            for e in self._events:
                 await asyncio.sleep(0)
-                yield d
+                yield e
 
         return _gen()
 
@@ -317,11 +332,10 @@ class TestBargeIn:
     async def test_barge_in_before_any_token_pops_user_msg(self) -> None:
         # Slow delta so cancel fires before anything arrives
         class _SlowStream(_StubStream):
-            @property
-            def text_stream(self) -> AsyncIterator[str]:
-                async def _gen() -> AsyncIterator[str]:
+            def __aiter__(self) -> AsyncIterator[Any]:
+                async def _gen() -> AsyncIterator[Any]:
                     await asyncio.sleep(0.5)
-                    yield "Never arrives. "
+                    yield _DeltaEvent("Never arrives. ")
 
                 return _gen()
 

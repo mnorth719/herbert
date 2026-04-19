@@ -29,11 +29,22 @@ Falling back to a 20-word threshold handles the long-winded monologue case
 where a model never emits terminal punctuation. `"Dr. Smith"` will split on
 the `.` — the plan accepts this as a known failure mode to revisit if it
 ever becomes audible.
+
+Tool-use latency filler
+-----------------------
+
+Server tools (web_search) can pause generation for several seconds. The
+persona asks Claude to emit a covering sentence first, but Haiku sometimes
+skips straight to the tool call. When we detect a `server_tool_use` content
+block arriving before any text has been emitted, we inject a canned filler
+sentence into the output stream so the TTS has something to say while the
+search runs. See `_TOOL_USE_FILLERS`.
 """
 
 from __future__ import annotations
 
 import logging
+import random
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
@@ -45,6 +56,25 @@ from herbert.session import Message, Session
 log = logging.getLogger(__name__)
 
 _BOUNDARY_CHARS = frozenset(".!?;")
+
+# Canned covering sentences we inject when Claude skips ahead to a tool call.
+# Kept short so TTS lands the audio quickly and the user's ear has something
+# to latch onto during the 2-6s search. Each ends with a period so the
+# SentenceBuffer flushes immediately on feed().
+_TOOL_USE_FILLERS: tuple[str, ...] = (
+    "Let me check.",
+    "One tick, looking that up.",
+    "Hold on a second.",
+    "Just a moment.",
+    "Let me see.",
+    "Consulting the network.",
+    "Hang on, going to pull that.",
+)
+
+# Tool-use content-block types we treat as "tool is starting". Both
+# `server_tool_use` (our use case with web_search) and the legacy
+# `tool_use` label are accepted for forward-compat with client tools.
+_TOOL_USE_BLOCK_TYPES = frozenset({"server_tool_use", "tool_use"})
 
 
 class LlmClientProtocol(Protocol):
@@ -209,20 +239,41 @@ async def stream_turn(
     else:
         stream_cm = stream_factory(**kwargs)
 
+    any_text_emitted = False
+
     async with stream_cm as stream:
-        async for delta in stream.text_stream:
-            now_ms = _elapsed_ms(start)
-            if state is not None:
-                state.tokens_received += 1
-                state.accumulated_text += delta
-                if state.ttft_ms is None:
-                    state.ttft_ms = now_ms
-            for sentence in buffer.feed(delta):
-                if state is not None:
-                    state.sentences_yielded += 1
-                    if state.first_sentence_ms is None:
-                        state.first_sentence_ms = _elapsed_ms(start)
-                yield sentence
+        async for event in stream:
+            event_type = getattr(event, "type", None)
+
+            # Tool starting with zero preceding text — inject a covering
+            # sentence locally so the TTS has something to say during the
+            # search. Fires at most once per turn (guarded by any_text_emitted).
+            if (
+                event_type == "content_block_start"
+                and _is_tool_use_start(event)
+                and not any_text_emitted
+            ):
+                filler = _pick_filler()
+                log.info("injecting tool-use filler: %r", filler)
+                async for sentence in _feed_text_into_buffer(
+                    filler + " ", buffer, state, start
+                ):
+                    any_text_emitted = True
+                    yield sentence
+                continue
+
+            # Text delta — normal streaming path
+            if event_type == "content_block_delta":
+                delta_obj = getattr(event, "delta", None)
+                if getattr(delta_obj, "type", None) == "text_delta":
+                    text = getattr(delta_obj, "text", "") or ""
+                    if not text:
+                        continue
+                    async for sentence in _feed_text_into_buffer(
+                        text, buffer, state, start
+                    ):
+                        any_text_emitted = True
+                        yield sentence
 
     # Flush any trailing text that never hit a boundary (rare but real)
     for sentence in buffer.flush():
@@ -246,3 +297,40 @@ async def stream_turn(
 
 def _elapsed_ms(start: float) -> int:
     return int((time.perf_counter() - start) * 1000)
+
+
+def _is_tool_use_start(event: Any) -> bool:
+    """Return True if `event` is a `content_block_start` for a tool-use block."""
+    block = getattr(event, "content_block", None)
+    block_type = getattr(block, "type", None)
+    return block_type in _TOOL_USE_BLOCK_TYPES
+
+
+def _pick_filler() -> str:
+    """Pick a covering sentence at random. Module-level so tests can patch."""
+    return random.choice(_TOOL_USE_FILLERS)
+
+
+async def _feed_text_into_buffer(
+    text: str,
+    buffer: SentenceBuffer,
+    state: LlmTurnState | None,
+    start: float,
+) -> AsyncIterator[str]:
+    """Common token-handling path: update state, flush sentences via buffer.
+
+    Extracted so the event loop can use the same bookkeeping for real text
+    deltas AND for locally-injected tool-use fillers.
+    """
+    now_ms = _elapsed_ms(start)
+    if state is not None:
+        state.tokens_received += 1
+        state.accumulated_text += text
+        if state.ttft_ms is None:
+            state.ttft_ms = now_ms
+    for sentence in buffer.feed(text):
+        if state is not None:
+            state.sentences_yielded += 1
+            if state.first_sentence_ms is None:
+                state.first_sentence_ms = _elapsed_ms(start)
+        yield sentence
