@@ -107,6 +107,7 @@ class DaemonDeps:
     llm_client: Any  # anthropic.AsyncAnthropic or a stub
     persona: str
     mcp_servers: list[dict[str, str]] | None = None
+    web_server: Any | None = None  # herbert.web.server.WebServer, set when CLI --expose or always-on
 
 
 class Daemon:
@@ -119,6 +120,7 @@ class Daemon:
         self._current_turn: Turn | None = None
         self._current_task: asyncio.Task[None] | None = None
         self._stopping = asyncio.Event()
+        self._bus_forward_task: asyncio.Task[None] | None = None
 
     @property
     def state(self) -> str:
@@ -132,6 +134,8 @@ class Daemon:
         """Main loop. Consumes the event source until `stop()` fires."""
         source: EventSource = self._deps.hal.event_source
         log.info("daemon ready, listening for button events")
+        if self._deps.web_server is not None:
+            self._bus_forward_task = asyncio.create_task(self._forward_bus_to_web())
         events = source.events()
         try:
             async for event in events:
@@ -143,7 +147,28 @@ class Daemon:
                     self._on_press_ended()
         finally:
             await self._cancel_current_turn(reason="daemon shutdown")
+            if self._bus_forward_task is not None:
+                self._bus_forward_task.cancel()
+                try:
+                    await self._bus_forward_task
+                except asyncio.CancelledError:
+                    pass
             await source.close()
+
+    async def _forward_bus_to_web(self) -> None:
+        """Subscribe to the bus and forward every event to the web thread.
+
+        The web server drains its janus queue from the other thread and
+        fans events out to connected WS clients.
+        """
+        web = self._deps.web_server
+        async with self._deps.bus.subscribe() as sub:
+            while True:
+                event = await sub.receive()
+                try:
+                    web.send_event(event)
+                except Exception as exc:
+                    log.warning("bus→web forward failed: %s", exc)
 
     async def stop(self) -> None:
         self._stopping.set()
@@ -302,21 +327,27 @@ def _load_persona(path: Path) -> str:
     return path.read_text()
 
 
-async def build_and_run(config: HerbertConfig, *, bus: AsyncEventBus) -> int:
+async def build_and_run(
+    config: HerbertConfig,
+    *,
+    bus: AsyncEventBus,
+    expose: bool = False,
+) -> int:
     """Wire up the live providers on the current platform and run the daemon.
 
-    This is the entry the CLI `dev` / `run` subcommands call into. For tests
-    that need a daemon bound to replay providers, construct `DaemonDeps`
-    directly and instantiate `Daemon` without going through this function.
+    When `expose=True` (or `config.web.expose`), the web server binds to
+    0.0.0.0 and requires a bearer token. Otherwise it stays on localhost
+    unauthenticated.
     """
     from anthropic import AsyncAnthropic
 
     from herbert.hal import build_hal, detect_platform
     from herbert.llm.mcp_passthrough import build_mcp_servers
-    from herbert.secrets import load_secrets
+    from herbert.secrets import ensure_frontend_bearer_token, load_secrets
     from herbert.stt.whisper_cpp import WhisperCppProvider
     from herbert.tts.elevenlabs_stream import ElevenLabsProvider
     from herbert.tts.piper import PiperProvider
+    from herbert.web.server import WebServer
 
     platform = detect_platform()
     hal = build_hal(
@@ -347,6 +378,21 @@ async def build_and_run(config: HerbertConfig, *, bus: AsyncEventBus) -> int:
     stt = WhisperCppProvider(
         model_path=Path.home() / ".herbert" / "models" / "ggml-base.en-q5_1.bin"
     )
+
+    effective_expose = expose or config.web.expose
+    bind_host = "0.0.0.0" if effective_expose else config.web.bind_host
+    bearer_token = ensure_frontend_bearer_token(config.secrets_path) if effective_expose else None
+
+    web_server = WebServer(
+        bind_host=bind_host,
+        port=config.web.port,
+        expose=effective_expose,
+        bearer_token=bearer_token,
+        health_provider=lambda: _build_health_payload(config, _daemon_ref),
+    )
+    web_server.start()
+    log.info("web server listening on %s (expose=%s)", web_server.url, effective_expose)
+
     deps = DaemonDeps(
         config=config,
         bus=bus,
@@ -356,7 +402,28 @@ async def build_and_run(config: HerbertConfig, *, bus: AsyncEventBus) -> int:
         llm_client=llm_client,
         persona=_load_persona(config.persona_path),
         mcp_servers=build_mcp_servers(config.mcp) or None,
+        web_server=web_server,
     )
     daemon = Daemon(deps)
-    await daemon.run()
+    # Capture the daemon reference so the health provider can read its state
+    _daemon_ref["daemon"] = daemon
+    try:
+        await daemon.run()
+    finally:
+        web_server.stop()
     return 0
+
+
+# Mutable holder so the health closure can observe the daemon after it's built
+_daemon_ref: dict[str, Any] = {}
+
+
+def _build_health_payload(config: HerbertConfig, ref: dict[str, Any]) -> dict[str, Any]:
+    daemon = ref.get("daemon")
+    return {
+        "status": "ok",
+        "state": daemon.state if daemon is not None else "starting",
+        "stt_provider": config.stt.provider,
+        "tts_provider": config.tts.provider,
+        "llm_model": config.llm.model,
+    }

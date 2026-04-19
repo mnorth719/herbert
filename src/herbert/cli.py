@@ -68,7 +68,7 @@ def _run_dev(cfg: HerbertConfig, args: argparse.Namespace, logger: logging.Logge
         _config_source(args.config),
         cfg.log_path,
     )
-    return _run_daemon(cfg)
+    return _run_daemon(cfg, expose=args.expose)
 
 
 def _run_production(cfg: HerbertConfig, args: argparse.Namespace, logger: logging.Logger) -> int:
@@ -83,17 +83,17 @@ def _run_production(cfg: HerbertConfig, args: argparse.Namespace, logger: loggin
         _config_source(args.config),
         cfg.log_path,
     )
-    return _run_daemon(cfg)
+    return _run_daemon(cfg, expose=args.expose)
 
 
-def _run_daemon(cfg: HerbertConfig) -> int:
+def _run_daemon(cfg: HerbertConfig, *, expose: bool = False) -> int:
     from herbert.daemon import build_and_run
 
     bus = AsyncEventBus()
     # Reattach logging with the bus so LogLine events flow to /ws in Unit 8+
     setup_logging(log_path=cfg.log_path, level=cfg.logging.level, bus=bus)
     try:
-        return asyncio.run(build_and_run(cfg, bus=bus))
+        return asyncio.run(build_and_run(cfg, bus=bus, expose=expose))
     except KeyboardInterrupt:
         return 0
 
