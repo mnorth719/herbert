@@ -87,7 +87,7 @@ No `docs/solutions/` exists yet at `/Users/matt/dev/herbert/` or `~/.claude/`. S
 |---|---|
 | **Python 3.12, uv-managed project, single package `herbert`** | Matches Matt's `rattlesnake` conventions; uv handles platform-conditional deps cleanly via PEP 508 markers. (see origin: Key Decisions) |
 | **Protocol-based adapter pattern for STT, TTS, EventSource, Audio IO, Display** | Matches R5/R2/R17-R18 requirements; follows `rattlesnake`'s `@runtime_checkable Protocol` precedent; enables swapping implementations by config without `if platform == ...` noise. |
-| **Web server = FastAPI + uvicorn single worker, WebSocket for state + SSE-style log tail** | Research consensus for a daemon-plus-browser pattern; Pydantic integration pays for itself on R15's observation endpoints; single worker keeps daemon state in one asyncio loop. |
+| **Web server = FastAPI + uvicorn in a *separate thread* with its own asyncio loop; daemon communicates with it via a thread-safe event queue (`janus.Queue`) + broadcast fan-out** | Research consensus on FastAPI/uvicorn; but running uvicorn in the same loop as audio I/O couples HTTP request latency to audio underruns (a slow SSE log-tail request could delay PortAudio's `call_soon_threadsafe` callbacks). Isolating uvicorn in its own thread+loop keeps the audio path jitter-free while still sharing state cleanly. Pydantic models + WebSocket/SSE still work identically. |
 | **Backend ↔ frontend transport = WebSocket** (one bidi channel per browser client) | Event-push is required by R10-R13 (real-time state). Single channel keeps the protocol trivial; JSON messages with a `type` discriminator. |
 | **STT = `pywhispercpp` + `ggml-base.en-q5_1.bin`** | Research shows q5_1 hits the R6 STT ≤1.2s ceiling on Pi 5 with NEON while preserving accuracy (q4_0 loses too much at conversational volume). Active maintenance, prebuilt aarch64 wheels. |
 | **TTS = ElevenLabs streaming via WebSocket (`text_to_speech.stream_input`, model `eleven_flash_v2_5`)** | 75-150ms TTFB vs ~300-500ms on HTTP chunked; fits R6's 300ms first-chunk ceiling. Async iterator integration with asyncio daemon is clean. |
@@ -230,18 +230,47 @@ herbert/
       test_redaction.py
       ...
     integration/
-      test_pipeline_replay.py    # replay-fixture-based voice loop
+      test_pipeline_replay.py    # replay-fixture-based voice loop (per-unit check)
       test_error_recovery.py     # network drop, API 5xx, mic fail
       test_diagnostic_mode.py
       test_latency_instrumentation.py
+    e2e/                         # Unit 7b — agent-verifiable signal; runs every "done" check
+      __init__.py
+      conftest.py
+      replay_transport.py        # ReplaySttProvider, ReplayLlmClient, ReplayTtsProvider, ReplayEventSource
+      invariants.py              # state-sequence, session-role-alternation, latency-span assertions
+      test_happy_path.py
+      test_multi_sentence.py
+      test_long_response.py
+      test_barge_in_during_speaking.py
+      test_barge_in_session_consistency.py
+      test_api_5xx_recovery.py
+      test_api_auth_terminal.py
+      test_wifi_drop_recovery.py
+      test_empty_utterance.py
+      test_diagnostic_trigger.py
     fixtures/
       turns/
-        hello-world/
+        hello-world/             # happy path seed (Unit 4 captures)
+        multi-sentence/
+        long-response/
+        user-interrupts-mid-speaking/
+        barge-in-before-first-token/
+        barge-in-after-first-token/
+        api-529-recovers/        # synthetic error fixture
+        api-auth-terminal/       # synthetic error fixture
+        wifi-drop-recovery/      # synthetic error fixture
+        empty-utterance/
+        diagnostic-trigger/
+        diagnostic-trigger-false-positive/
           input.wav
           stt.json
           llm_stream.jsonl
           tts_chunks.bin
           tts_manifest.json
+          expected_state_sequence.json
+          expected_session_messages.json
+          expected_log_events.json
     conftest.py                  # pytest fixtures: mock HAL, replay transport
   scripts/
     dev-install.sh               # one-shot dev setup (Mac)
@@ -289,7 +318,8 @@ This structure is a scope declaration, not a constraint — the per-unit `**File
 Each turn has:
 - A unique `turn_id` (ULID)
 - A `TurnSpan` that collects per-stage timings
-- An `asyncio.Event cancel_event` — if the button is pressed mid-turn, `cancel_event.set()` fans out to all three pipeline workers, each of which treats it as a soft interrupt (close WS, abort stream, flush audio buffer)
+- **Structured cancellation via `asyncio.TaskGroup`:** the turn's STT, LLM, TTS, and audio-playback workers run as child tasks in a `TaskGroup`. Barge-in calls `tg.cancel()` (or cancels the parent task that owns the group), which propagates `CancelledError` into every child's current `await`. Each worker handles `CancelledError` in a `finally` block to run its specific cleanup (close Anthropic stream context manager via `__aexit__`, close ElevenLabs WebSocket, drain/discard audio playback buffer). This replaces the earlier-proposed shared `asyncio.Event` pattern: `Event.set()` does not interrupt a blocked `await` on an SDK generator, but `task.cancel()` does.
+- **Session consistency on cancellation:** if the assistant response had started streaming when cancel fires, the partial text is appended to `Session.messages` with a trailing `[interrupted]` marker; if not a single token has been received, the user message is popped from the session so Claude doesn't see two consecutive user messages on the next turn (which would break the alternating-role constraint).
 - A lifecycle: `LISTENING → TRANSCRIBING → THINKING → SPEAKING → (IDLE | ERROR)` with explicit state transitions emitting `StateChanged` events
 
 ### Sentence-boundary LLM → TTS handoff
@@ -407,7 +437,7 @@ View transitions are triggered locally on the client from WS `ViewChanged` event
 
 ---
 
-### Milestone M2 — Voice loop on Mac
+### Milestone M2 — Voice loop on Mac + e2e test harness
 
 - [ ] **Unit 3: HAL — EventSource, AudioIn, AudioOut protocols + Mac adapters**
 
@@ -646,6 +676,87 @@ class StateMachine:
 
 ---
 
+- [ ] **Unit 7b: E2E test harness + replay fixture corpus**
+
+**Goal:** Build a deterministic, credit-free end-to-end test harness that replays recorded fixtures through the full pipeline. Produce a corpus of 10 fixtures covering happy path, barge-in, error recovery, and trigger-phrase edge cases. Every subsequent unit's "done" definition becomes `pytest tests/e2e/` green.
+
+This is the **primary validation surface for agent-driven work**: the harness runs fast (no live API), covers the paths that unit tests miss (streaming semantics, cancellation races, session consistency across turns), and catches regressions the moment they appear. Without this, the agent has no reliable signal that a change didn't silently break barge-in or session consistency.
+
+**Requirements:** Meta — enables validation of R4, R6, R10, R12, R13, R16, R22 without live API dependency. Directly addresses the P2 finding that Unit 14's "10 fixtures" was promised but only one was scoped.
+
+**Dependencies:** Units 2, 3, 4, 5, 6, 7
+
+**Files:**
+- Create: `tests/e2e/__init__.py`, `tests/e2e/conftest.py`
+- Create: `tests/e2e/replay_transport.py` (fake `SttProvider`, `LlmClient`, `TtsProvider` that read fixture files and replay chunks with original inter-chunk timing)
+- Create: `tests/e2e/invariants.py` (assertions used across scenarios: state-sequence invariant, session-role-alternation invariant, latency-span-emitted invariant)
+- Create: `tests/e2e/test_happy_path.py` — fixture `hello-world`
+- Create: `tests/e2e/test_multi_sentence.py` — fixture `multi-sentence`
+- Create: `tests/e2e/test_long_response.py` — fixture `long-response`
+- Create: `tests/e2e/test_barge_in_during_speaking.py` — fixture `user-interrupts-mid-speaking`
+- Create: `tests/e2e/test_barge_in_session_consistency.py` — fixture `barge-in-before-first-token` (verifies user-msg popped) + `barge-in-after-first-token` (verifies `[interrupted]` marker appended)
+- Create: `tests/e2e/test_api_5xx_recovery.py` — fixture `api-529-recovers`
+- Create: `tests/e2e/test_api_auth_terminal.py` — fixture `api-auth-terminal`
+- Create: `tests/e2e/test_wifi_drop_recovery.py` — fixture `wifi-drop-recovery`
+- Create: `tests/e2e/test_empty_utterance.py` — fixture `empty-utterance`
+- Create: `tests/e2e/test_diagnostic_trigger.py` — fixture `diagnostic-trigger` (whole-utterance match) + `diagnostic-trigger-false-positive` ("Herbert, show me the logs from yesterday" does NOT match)
+- Create: `tests/fixtures/turns/<name>/` directories for each fixture, each containing: `input.wav`, `stt.json` (final + segments), `llm_stream.jsonl` (either Claude events OR a synthetic deterministic stream for error cases), `tts_chunks.bin` + `tts_manifest.json` (chunk sizes, inter-chunk timings), `expected_state_sequence.json`, `expected_session_messages.json`, `expected_log_events.json`
+- Create: `scripts/capture-fixture.py` — helper to capture a real live turn and serialize all artifacts into a fixture directory (used during fixture authoring only; not part of CI)
+
+**Approach:**
+- `ReplayTransport` implements the provider `Protocol`s from Units 4, 5, 6 — test code swaps real providers for replay versions at the DI boundary
+- Each replay provider reads its fixture file and yields chunks with `asyncio.sleep(interval)` between them, preserving the streaming timing of the original recording. This is what lets e2e tests catch sentence-boundary timing regressions, cancellation races, and backpressure bugs that pure-mocks would miss
+- Error cases (5xx, auth, wifi drop) are synthesized — `llm_stream.jsonl` contains explicit `error` events the ReplayLlmClient raises at the recorded offset
+- Barge-in fixtures inject a `PressStarted` event at a recorded offset relative to the turn start
+- Invariant assertions run after every scenario:
+  1. `assert_state_sequence(actual_states, expected)` — state transitions in order, no extras, no missing
+  2. `assert_session_valid(session)` — alternating roles, no empty content, partial responses marked `[interrupted]` where expected
+  3. `assert_latency_spans(log_events)` — `exchange_latency` emitted with all stages populated
+  4. `assert_no_unexpected_errors(log_events)` — no unredacted-secret patterns in log output
+- `scripts/capture-fixture.py` is a dev tool, not a production dependency. Running it requires `HERBERT_LIVE=1`; it captures a real turn end-to-end and serializes everything into a fixture directory that then powers deterministic replay
+
+**Technical design:**
+
+```
+tests/e2e/
+  replay_transport.py
+    ReplaySttProvider(fixture_dir).transcribe(pcm) -> reads stt.json, emits SttResult
+    ReplayLlmClient(fixture_dir).stream_turn(...) -> async-iterates llm_stream.jsonl, sleeps per timing
+    ReplayTtsProvider(fixture_dir).stream(sentences) -> async-iterates tts_chunks.bin, sleeps per manifest
+    ReplayEventSource(fixture_dir).events() -> injects PressStarted/PressEnded at recorded offsets (including barge-in)
+
+  conftest.py
+    @pytest.fixture e2e_daemon(fixture_dir) -> spins up a daemon with replay providers wired in, yields a handle with .run_turn(), .state_history, .session, .log_events
+```
+
+**Patterns to follow:**
+- Best-practices research: VCR/Betamax cassette pattern adapted for streaming — recorded `(ts_ms, chunk_bytes)` tuples, not just final outputs
+- Pipecat / Cekura voice-agent-testing guidance referenced in original research
+
+**Execution note:** Start by writing `test_happy_path.py` + `replay_transport.py` against the Unit 4 `hello-world` fixture — get ONE e2e scenario green end-to-end before building the other 9. Each subsequent fixture test is then incremental.
+
+**Test scenarios:**
+- Happy path: `hello-world` fixture — full turn plays back; all 4 character states traversed in order; session has 2 messages (user + assistant); `exchange_latency` event emitted with all stages populated.
+- Happy path: `multi-sentence` fixture — three sentences stream to TTS in order; no gap > 200ms between sentences.
+- Happy path: `long-response` fixture — 500-token Claude response; sentence-boundary flushes happen progressively; playback starts before Claude finishes generating.
+- Edge case (cancellation): `barge-in-before-first-token` — second `PressStarted` fires at T+50ms (before Claude has emitted a token). After cancel: session's final state has NO assistant message (user-msg popped to preserve alternation); new turn begins cleanly; no orphan state transitions logged.
+- Edge case (cancellation): `barge-in-after-first-token` — second `PressStarted` fires after Claude has emitted "The weather is"; after cancel: session's assistant message ends with `[interrupted]`; TTS audio truncates; new turn begins cleanly.
+- Edge case: `user-interrupts-mid-speaking` — barge-in fires while audio is actively playing; audio buffer drains within 100ms; no audio plays after cancel point.
+- Error path: `api-529-recovers` — synthetic 529 fires mid-stream; error state entered; auto-retry after 1s; success on retry → idle; "I'm back" cue event published (actual playback tested separately in Unit 11).
+- Error path: `api-auth-terminal` — synthetic 401 fires; error state entered with `api_auth` class; no retry; state remains in error until `PressStarted`; next press transitions to listening (manual retry).
+- Error path: `wifi-drop-recovery` — synthetic connection error mid-stream; same recovery shape as 529 case.
+- Edge case: `empty-utterance` — STT returns empty string; daemon skips LLM call; returns to idle; no session append.
+- Edge case: `diagnostic-trigger` — STT returns "herbert show me the logs"; regex matches whole-utterance; view switches to diagnostic; LLM NOT called; session NOT modified.
+- Edge case: `diagnostic-trigger-false-positive` — STT returns "herbert show me the logs from yesterday"; regex does NOT match; LLM IS called; view stays character.
+
+**Verification:**
+- `pytest tests/e2e/` runs all 11 scenarios green in under 30 seconds on Mac (no live API calls).
+- Every scenario emits the expected state sequence and session content.
+- Invariant assertions catch synthetic mutations (e.g., deliberately breaking session-role-alternation in a test harness sanity check).
+- Documented in `CLAUDE.md`: "When finishing a unit, `pytest tests/e2e/` must be green."
+
+---
+
 ### Milestone M3 — Web frontend + fake boot
 
 - [ ] **Unit 8: FastAPI web server + WebSocket state channel + auth scaffolding**
@@ -659,7 +770,7 @@ class StateMachine:
 **Files:**
 - Create: `src/herbert/web/app.py`, `src/herbert/web/ws.py`, `src/herbert/web/auth.py`
 - Create: `src/herbert/web/static/` (empty — frontend mounts here after Unit 9)
-- Modify: `src/herbert/daemon.py` (launch uvicorn as an asyncio task)
+- Modify: `src/herbert/daemon.py` (launch uvicorn in a dedicated thread with its own event loop; coordinate shutdown via `server.should_exit` + `thread.join(timeout=...)`)
 - Modify: `src/herbert/cli.py` (add `--expose` flag)
 - Modify: `src/herbert/config.py` (add `web.bind_host`, `web.port`, `web.expose`)
 - Modify: `src/herbert/secrets.py` (generate `FRONTEND_BEARER_TOKEN` on first boot if missing)
@@ -667,14 +778,17 @@ class StateMachine:
 
 **Approach:**
 - FastAPI app with: `/healthz` (JSON: daemon state, provider status, recent latency), `/ws` (WebSocket for state events), `/api/logs/tail` (SSE for log tail), static mount at `/`
-- Bearer token middleware: enforced only when `web.expose=true`; localhost binding → no auth required
+- Bearer token middleware: enforced only when `web.expose=true`. **Localhost binding is unauthenticated by design — local processes on the device are trusted.** This is a deliberate single-user-home-device trust model, not an oversight.
 - On first boot, if `FRONTEND_BEARER_TOKEN` missing in secrets file, generate a URL-safe 32-byte token and append to `~/.herbert/secrets.env`
 - `/ws` subscribes to event bus, pushes `StateChanged`, `TranscriptDelta`, `ExchangeLatency`, `LatencyMiss`, `ViewChanged`, `ErrorOccurred` as JSON
-- uvicorn runs inside the main asyncio loop as a task (not a subprocess); `uvicorn.Server` with `Config(loop="asyncio", lifespan="on")`
+- **uvicorn runs in a *separate thread* with its own asyncio loop.** Rationale: keeps audio-path jitter independent of HTTP request latency (an SSE log-tail request serializing 100MB of rotated log content should not block PortAudio callbacks). Implementation: main daemon starts uvicorn via `threading.Thread(target=lambda: asyncio.run(serve(...)))`; cross-thread communication via `janus.Queue` (thread-safe both ways). Daemon publishes `Event`s to janus; uvicorn thread drains them to WS clients. Uvicorn shutdown coordinated via `server.should_exit = True` from the daemon's `finally`
+- **Transport posture for `--expose` mode: HTTP over LAN, no TLS.** This is a deliberate accepted risk for a single-user personal home device. Consequences: the bearer token is visible to LAN observers via QR scan, and in uvicorn access logs (mitigated by the RedactingFilter). TLS with a self-signed cert was considered and rejected as over-engineering for this threat model. Revisit if Herbert ever moves to a shared/guest network
+- `/ws` uses `Authorization: Bearer <token>` header (standard); the token-in-URL path `?token=<t>` is supported as a fallback for QR-scanning convenience, with the understanding that URL tokens are redacted from access logs via the R14 RedactingFilter
 
 **Patterns to follow:**
 - FastAPI WebSocket docs (lifecycle, broadcasting)
 - `hmac.compare_digest` for token comparison
+- `janus.Queue` for async↔thread safe queues between the audio loop and the uvicorn loop
 
 **Test scenarios:**
 - Happy path: localhost bind, WS connection without token accepted; state events flow.
@@ -921,38 +1035,39 @@ class StateMachine:
 
 ---
 
-- [ ] **Unit 14: End-to-end smoke tests + README + ship prep**
+- [ ] **Unit 14: Ship prep — README, CLAUDE.md, clean-room install, Pi smoke**
 
-**Goal:** Comprehensive smoke test suite, user-facing README, CLAUDE.md updates, and final polish. Aim: someone else could clone and run Herbert on both Mac and Pi from the README alone.
+**Goal:** User-facing documentation, one-shot install scripts, and a final clean-room pass on both platforms. E2E test coverage was already delivered in Unit 7b — this unit is documentation and real-hardware verification, not test authoring.
 
-**Requirements:** All. This unit verifies the full spec.
+**Requirements:** All. This unit verifies the full spec reaches a user who didn't build it.
 
-**Dependencies:** Units 1-13
+**Dependencies:** Units 1-13 (all prior)
 
 **Files:**
-- Create: `tests/integration/test_smoke_mac.py`
-- Create: `tests/integration/test_smoke_pi.py` (gated by `HERBERT_PI_SMOKE=1`, run on Pi)
+- Create: `tests/integration/test_smoke_pi.py` (gated by `HERBERT_PI_SMOKE=1`, run on Pi — exercises real GPIO + real audio devices + real Chromium kiosk)
 - Modify: `README.md` (install, first-time setup, daily use, troubleshooting, config reference)
-- Modify: `CLAUDE.md` (architecture overview, design decisions, how-to-contribute for future Matt)
+- Modify: `CLAUDE.md` (architecture overview, design decisions, how-to-contribute for future Matt, pointer to `tests/e2e/` as the primary validation surface)
 - Modify: `scripts/dev-install.sh` (Mac one-shot setup)
 - Modify: `scripts/pi-install.sh` (Pi one-shot setup)
 
 **Approach:**
-- Mac smoke: run daemon, mock HAL, drive 10 turns via replay fixtures, assert all success criteria from origin (latency <5% miss, state transitions correct, diagnostic mode works, persona reload works, expose+auth rejects wrong token).
-- Pi smoke: same test plus real hardware checks (GPIO button physically wired, audio pinned to USB device, kiosk loads).
+- Pi smoke: real hardware checks (GPIO button physically wired, audio pinned to USB device, Chromium kiosk loads and renders the frontend correctly, full cold-boot → idle → voice turn → reply). Gated behind an env flag so it does not run in Mac-dev CI.
 - README sections: **Quick start (Mac)**, **Quick start (Pi)**, **Config reference**, **Swapping voices**, **Swapping providers (cloud STT)**, **Troubleshooting** (common failures: missing secrets, mic not detected, kiosk white screen, ElevenLabs rate limit, whisper model not found).
-- CLAUDE.md sections: **Architecture at a glance**, **Key decisions and why**, **How to add a provider**, **How to add a new event type**, **How to debug a stuck state**.
+- CLAUDE.md sections: **Architecture at a glance**, **Key decisions and why**, **How to add a provider**, **How to add a new event type**, **How to debug a stuck state**, **How to run the e2e suite** (`pytest tests/e2e/` — the canonical "is Herbert broken?" check).
+- Clean-room install test: on a freshly wiped Mac environment, the dev-install.sh script + README instructions produce a working `herbert dev`. Same on a fresh Pi image with pi-install.sh.
 
 **Test scenarios:**
-- Happy path: Mac smoke runs all 10 fixtures, asserts success criteria.
-- Happy path: Pi smoke (manual trigger) runs full cold-boot → voice loop.
-- Identity test (deferred per R8): Matt uses Herbert daily for 2 weeks and names Herbert-isms — evaluated qualitatively.
+- Happy path (Pi smoke): hold GPIO button, speak, hear Herbert reply through USB speaker within R6 p50 target. Kiosk displays character reacting through 4 states.
+- Happy path (Pi smoke): `systemctl --user status herbert-daemon` and `herbert-kiosk` both active after cold boot.
+- Happy path (clean-room Mac): wipe `~/.herbert/`, delete `.venv`, follow README → voice loop works on first try.
+- Happy path (clean-room Pi): fresh Pi OS install → `pi-install.sh` → voice loop works on first cold boot.
+- Identity test (deferred per R8 success criterion): Matt uses Herbert daily for 2 weeks and names 2-3 Herbert-isms — evaluated qualitatively, not automated.
 
 **Verification:**
-- Both smoke suites pass.
-- Clean-room install test: wipe Mac environment, follow README, run `herbert dev`, voice loop works on first try.
-- Clean-room install test on Pi: same.
-- `uv run ruff check` clean; `uv run pytest` clean.
+- `pytest tests/e2e/` remains green (Unit 7b's suite, re-run after all prior units landed).
+- Pi smoke suite passes when `HERBERT_PI_SMOKE=1` is set on a real Pi 5.
+- Clean-room install test documented and followed successfully on both platforms.
+- `uv run ruff check` clean; `uv run pytest` clean (unit + integration + e2e).
 
 ---
 
@@ -996,7 +1111,7 @@ class StateMachine:
 | Milestone | Scope | Demoable outcome |
 |---|---|---|
 | **M1** (Units 1-2) | Scaffold, config, secrets, logging, event bus | `herbert dev` prints "ready"; logs events to disk with redaction. |
-| **M2** (Units 3-7) | Voice loop on Mac end-to-end | Hold spacebar, speak, hear Herbert reply on Mac. First real vertical slice. |
+| **M2** (Units 3-7, 7b) | Voice loop on Mac end-to-end + e2e test harness | Hold spacebar, speak, hear Herbert reply on Mac. **`pytest tests/e2e/` green across 11 scenarios — the agent-verifiable signal every subsequent unit depends on.** |
 | **M3** (Units 8-9) | Web frontend + fake boot | Pixel-art character reacts to state live; fake boot sequence plays. Full retro vibe visible. |
 | **M4** (Unit 10) | Pi 5 deployment | Power on a Pi, press physical button, voice loop works. First "it's a real device" moment. |
 | **M5** (Units 11-12) | Observability, recovery, diagnostic mode, transcript polish | Latency instrumented; unplug wifi + recover; voice-triggered diagnostic mode; transcript lifecycle correct. |
