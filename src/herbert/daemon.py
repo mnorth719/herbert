@@ -129,6 +129,14 @@ class Daemon:
         # Mode label that shows up on every TurnStarted / ExchangeLatency
         # event. Used by the R6 ceiling lookup in `TurnSpan.evaluate_ceilings`.
         self._mode = "pi_hybrid" if deps.hal.platform == "pi" else "mac_hybrid"
+        # False until daemon.run() starts (after model warmup). The frontend
+        # reads this via /healthz so it can show a "warming" look instead
+        # of claiming Herbert is ready while models are still loading.
+        self._ready = False
+
+    @property
+    def ready(self) -> bool:
+        return self._ready
 
     @property
     def state(self) -> str:
@@ -141,6 +149,7 @@ class Daemon:
     async def run(self) -> None:
         """Main loop. Consumes the event source until `stop()` fires."""
         source: EventSource = self._deps.hal.event_source
+        self._ready = True
         log.info("daemon ready, listening for button events")
         if self._deps.web_server is not None:
             self._bus_forward_task = asyncio.create_task(self._forward_bus_to_web())
@@ -556,6 +565,22 @@ async def build_and_run(
     # Capture the daemon reference so the health provider can read its state
     _daemon_ref["daemon"] = daemon
 
+    # Pre-load models SYNCHRONOUSLY before we enter the event loop. Herbert
+    # is meant to stay on between sessions, so paying the one-time model
+    # load at boot (instead of on the user's first button press) is the
+    # right tradeoff. STT + TTS warmups run in parallel; any missing files
+    # or unreadable voices raise here and fail startup loudly.
+    warmup_start = asyncio.get_running_loop().time()
+    warmups: list[asyncio.Task[None]] = []
+    if hasattr(stt, "warmup"):
+        warmups.append(asyncio.create_task(stt.warmup()))  # type: ignore[attr-defined]
+    if hasattr(tts, "warmup"):
+        warmups.append(asyncio.create_task(tts.warmup()))  # type: ignore[attr-defined]
+    if warmups:
+        await asyncio.gather(*warmups)
+        warmup_ms = int((asyncio.get_running_loop().time() - warmup_start) * 1000)
+        log.info("models warmed in %dms; daemon ready", warmup_ms)
+
     try:
         await daemon.run()
     finally:
@@ -571,6 +596,7 @@ def _build_health_payload(config: HerbertConfig, ref: dict[str, Any]) -> dict[st
     daemon = ref.get("daemon")
     return {
         "status": "ok",
+        "ready": bool(daemon and daemon.ready),
         "state": daemon.state if daemon is not None else "starting",
         "stt_provider": config.stt.provider,
         "tts_provider": config.tts.provider,

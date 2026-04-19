@@ -52,6 +52,16 @@ class WhisperCppProvider:
         self._model: Any | None = None
         self._load_lock = asyncio.Lock()
 
+    async def warmup(self) -> None:
+        """Force the ONNX / ggml model load so the first real transcribe is warm.
+
+        Safe to call eagerly from startup: idempotent, guarded by the same
+        lock as `_ensure_loaded`, and raises `WhisperModelMissingError` if
+        the model file is absent (so the caller can log the problem without
+        waiting for the first turn to discover it).
+        """
+        await self._ensure_loaded()
+
     async def transcribe(self, pcm: bytes, sample_rate: int = 16000) -> SttResult:
         if sample_rate != WHISPER_SAMPLE_RATE:
             raise ValueError(

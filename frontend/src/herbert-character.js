@@ -20,11 +20,14 @@ const COLORS = {
   body: 0x262d35,
   bodyOutline: 0x4a5560,
   eyeBase: 0x0a0e10,
-  idle:      { halo: 0x4a5560, eye: 0x9aa8b4 },
-  listening: { halo: 0x3ac267, eye: 0xbbffcf },
-  thinking:  { halo: 0xf2a03d, eye: 0xffd9a0 },
-  speaking:  { halo: 0x3ab3ff, eye: 0xcfe9ff },
-  error:     { halo: 0xf04060, eye: 0xffb0bc },
+  idle:         { halo: 0x4a5560, eye: 0x9aa8b4 },
+  listening:    { halo: 0x3ac267, eye: 0xbbffcf },
+  thinking:     { halo: 0xf2a03d, eye: 0xffd9a0 },
+  speaking:     { halo: 0x3ab3ff, eye: 0xcfe9ff },
+  error:        { halo: 0xf04060, eye: 0xffb0bc },
+  // Lifecycle states (not driven by the server state machine):
+  warming:      { halo: 0x9b70d8, eye: 0xdcc6ff },  // purple — loading models
+  disconnected: { halo: 0x1a2128, eye: 0x3a4550 },  // dim grey — no signal
 };
 
 export function createHerbert() {
@@ -86,6 +89,10 @@ export function createHerbert() {
       for (let i = 0; i < MOUTH_BARS; i++) mouthLevels[i] = mouthTargets[i] = 0;
     }
   };
+
+  // Expose the raw color map so the main module can color the status bar
+  // to match whichever lifecycle/pipeline state is active.
+  root.stateColor = (name) => COLORS[name]?.halo ?? COLORS.idle.halo;
 
   root.tick = (delta) => {
     t += delta;
@@ -184,6 +191,16 @@ function drawHalo(g, cx, cy, state, t) {
       pulse = Math.sin(t * 0.55) * 0.25;
       base = 0.35;
       break;
+    case 'warming':
+      // Slow, gentle swelling — like a breath, but more deliberate
+      pulse = Math.sin(t * 0.1) * 0.15;
+      base = 0.28;
+      break;
+    case 'disconnected':
+      // Barely visible; no pulse
+      pulse = 0;
+      base = 0.06;
+      break;
   }
   const alpha = Math.max(0.05, Math.min(0.75, base + pulse));
   g.clear();
@@ -213,6 +230,20 @@ function drawEyes(left, right, cx, cy, state, t) {
       const yOff = blink ? 2 : 0;
       left.rect(leftX - 3, baseY + yOff, 6, h).fill(eyeColor);
       right.rect(rightX - 3, baseY + yOff, 6, h).fill(eyeColor);
+      break;
+    }
+    case 'warming': {
+      // Slow rolling dots — loading models. Height oscillates sinusoidally.
+      const phase = t * 0.08;
+      const h = 3 + Math.abs(Math.sin(phase)) * 3;
+      left.rect(leftX - 3, baseY + (6 - h) / 2, 6, h).fill(eyeColor);
+      right.rect(rightX - 3, baseY + (6 - h) / 2, 6, h).fill(eyeColor);
+      break;
+    }
+    case 'disconnected': {
+      // Eyes off — dim horizontal slits, no activity
+      left.rect(leftX - 3, baseY + 3, 6, 1).fill(eyeColor);
+      right.rect(rightX - 3, baseY + 3, 6, 1).fill(eyeColor);
       break;
     }
     case 'listening': {

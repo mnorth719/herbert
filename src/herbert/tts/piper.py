@@ -62,6 +62,16 @@ class PiperProvider:
             _read_sample_rate(voice_path) if voice_path.exists() else None
         )
 
+    async def warmup(self) -> None:
+        """Force the ONNX voice load so the first real stream() is warm.
+
+        Idempotent (guarded by the same lock as `_ensure_loaded`). Raises
+        `PiperVoiceMissingError` at startup if the voice file is absent,
+        so the daemon fails fast rather than surfacing the error on the
+        first button press.
+        """
+        await self._ensure_loaded()
+
     @property
     def sample_rate(self) -> int:
         if self._sample_rate is None:

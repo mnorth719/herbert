@@ -72,19 +72,74 @@ async function main() {
   const stateBadge = document.getElementById('state');
   const errorBadge = document.getElementById('error-badge');
 
+  // Lifecycle layer: overrides the pipeline state whenever Herbert isn't
+  // actually reachable-and-ready. Priority order is:
+  //   1. WS closed/connecting  → 'disconnected'
+  //   2. Daemon not ready yet  → 'warming' (loading models)
+  //   3. Otherwise             → last pipelineState ('idle'/'listening'/...)
+  let lifecycleState = 'disconnected';
+  let pipelineState = 'idle';
+  let readyPollCtrl = null;
+
+  const applyState = () => {
+    const effective =
+      lifecycleState === 'disconnected' ? 'disconnected'
+      : lifecycleState === 'warming'    ? 'warming'
+      : pipelineState;
+    character.setState(effective);
+    stateBadge.textContent = effective;
+  };
+  applyState();
+
+  // Poll /healthz until daemon reports ready=true, then flip to pipeline
+  // mode. Stops polling cleanly if WS drops or the page navigates away.
+  async function waitForReady() {
+    if (readyPollCtrl) readyPollCtrl.abort();
+    const ctrl = new AbortController();
+    readyPollCtrl = ctrl;
+    const authSuffix = token ? `?token=${encodeURIComponent(token)}` : '';
+    while (!ctrl.signal.aborted) {
+      try {
+        const resp = await fetch(`/healthz${authSuffix}`, { signal: ctrl.signal });
+        if (resp.ok) {
+          const data = await resp.json();
+          if (data.ready) {
+            lifecycleState = 'ready';
+            applyState();
+            return;
+          }
+        }
+      } catch (err) {
+        if (ctrl.signal.aborted) return;
+        // Network flake — ignore and retry
+      }
+      await new Promise((r) => setTimeout(r, 500));
+    }
+  }
+
   connectWs({
     token,
     onConnectionChange(state) {
       connBadge.textContent = state === 'open' ? 'connected' : state;
+      if (state === 'open') {
+        lifecycleState = 'warming';
+        applyState();
+        waitForReady();
+      } else {
+        // 'closed', 'connecting', 'error' — no signal, show disconnected
+        lifecycleState = 'disconnected';
+        if (readyPollCtrl) readyPollCtrl.abort();
+        applyState();
+      }
     },
     onEvent(evt) {
       switch (evt.event_type) {
         case 'state_changed':
-          character.setState(evt.to_state);
-          stateBadge.textContent = evt.to_state;
+          pipelineState = evt.to_state;
           if (evt.to_state !== 'error') {
             errorBadge.classList.remove('visible');
           }
+          applyState();
           break;
         case 'turn_started':
           onTurnStarted();
