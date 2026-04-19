@@ -32,9 +32,17 @@ def create_app(
     auth: AuthConfig,
     broadcaster: Broadcaster,
     health_provider,  # type: ignore[no-untyped-def]
+    snapshot_accessor=None,  # type: ignore[no-untyped-def]
     static_dir: Path = STATIC_DIR,
 ) -> FastAPI:
-    """Build the FastAPI instance. Dependencies are injected by the server factory."""
+    """Build the FastAPI instance. Dependencies are injected by the server factory.
+
+    `snapshot_accessor` is a zero-arg callable that returns the current
+    snapshot provider (another callable) — or None if not yet configured.
+    This double-indirection lets the daemon register/replace the provider
+    *after* the web thread has started. /api/boot_snapshot reads through
+    it on every request, so persona hot-reloads show up immediately.
+    """
     app = FastAPI(
         title="Herbert",
         docs_url=None,  # no need for swagger on a single-user device
@@ -46,6 +54,21 @@ def create_app(
     async def healthz(_auth: None = Depends(http_auth)) -> JSONResponse:
         payload: dict[str, Any] = health_provider()
         return JSONResponse(payload)
+
+    @app.get("/api/boot_snapshot")
+    async def boot_snapshot(_auth: None = Depends(http_auth)) -> JSONResponse:
+        accessor = snapshot_accessor
+        provider = accessor() if accessor is not None else None
+        if provider is None:
+            return JSONResponse(
+                {"error": "snapshot provider not yet configured"},
+                status_code=503,
+            )
+        try:
+            return JSONResponse(provider())
+        except Exception as exc:
+            log.warning("boot snapshot provider raised: %s", exc)
+            return JSONResponse({"error": str(exc)}, status_code=500)
 
     @app.websocket("/ws")
     async def ws_endpoint(ws: WebSocket) -> None:

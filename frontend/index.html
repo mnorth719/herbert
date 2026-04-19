@@ -129,6 +129,58 @@
         display: none;
       }
       #diagnostic.visible { display: block; }
+      #diagnostic .diag-section {
+        margin-bottom: 14px;
+        padding: 8px 10px;
+        background: #0d1318;
+        border: 1px solid #1a2128;
+      }
+      #diagnostic .diag-section h3 {
+        margin: 0 0 8px 0;
+        font-size: 10px;
+        letter-spacing: 1.5px;
+        text-transform: uppercase;
+        color: #6a7a86;
+      }
+      #diagnostic .diag-kv { width: 100%; font-size: 11px; }
+      #diagnostic .diag-kv td {
+        padding: 2px 8px;
+        vertical-align: top;
+      }
+      #diagnostic .diag-kv td:first-child {
+        color: #6a7a86;
+        text-transform: uppercase;
+        font-size: 9px;
+        letter-spacing: 0.5px;
+        white-space: nowrap;
+        padding-top: 4px;
+      }
+      #diagnostic .diag-kv td:last-child {
+        color: var(--fg);
+        font-family: var(--mono);
+        word-break: break-all;
+      }
+      #diagnostic .diag-prompt {
+        margin-top: 10px;
+        border-top: 1px dashed #1a2128;
+        padding-top: 8px;
+      }
+      #diagnostic .diag-prompt summary {
+        cursor: pointer;
+        color: var(--accent);
+        font-size: 10px;
+        letter-spacing: 0.5px;
+        text-transform: uppercase;
+      }
+      #diagnostic .diag-prompt pre {
+        margin: 8px 0 0;
+        white-space: pre-wrap;
+        word-break: break-word;
+        font-size: 11px;
+        line-height: 1.5;
+        color: #c8d2db;
+      }
+      #diagnostic #diag-log-body { max-height: 400px; overflow-y: auto; }
       #diagnostic .error-banner {
         position: sticky;
         top: 0;

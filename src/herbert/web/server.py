@@ -48,6 +48,10 @@ class WebServer:
         self._port = port
         self._auth = AuthConfig(expose=expose, bearer_token=bearer_token)
         self._health_provider = health_provider or (lambda: {"status": "ok"})
+        # Late-bound snapshot provider. The daemon sets this after it
+        # finishes wiring up persona + tools so /api/boot_snapshot can
+        # return current state. Until set, the endpoint returns 503.
+        self._snapshot_provider: Callable[[], dict[str, Any]] | None = None
         self._queue: janus.Queue[BaseModel] | None = None
         self._broadcaster: Broadcaster | None = None
         self._server: uvicorn.Server | None = None
@@ -119,6 +123,7 @@ class WebServer:
             auth=self._auth,
             broadcaster=self._broadcaster,
             health_provider=self._health_provider,
+            snapshot_accessor=lambda: self._snapshot_provider,
         )
         config = uvicorn.Config(
             app,

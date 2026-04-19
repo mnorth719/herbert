@@ -581,7 +581,8 @@ async def build_and_run(
     web_server.start()
     log.info("web server listening on %s (expose=%s)", web_server.url, effective_expose)
 
-    from herbert.llm.tools import build_tool_beta_headers, build_tools
+    from herbert.boot_snapshot import build_snapshot, log_snapshot
+    from herbert.llm.tools import TOOLS_PERSONA_ADDENDUM, build_tool_beta_headers, build_tools
     from herbert.persona import PersonaCache
 
     tools = build_tools(
@@ -615,6 +616,44 @@ async def build_and_run(
     daemon = Daemon(deps)
     # Capture the daemon reference so the health provider can read its state
     _daemon_ref["daemon"] = daemon
+
+    # Build a snapshot provider that reconstructs the current state each
+    # time it's called — so persona hot-reloads + any future memory
+    # content show up fresh. Used both for the boot-time log entry and
+    # for the /api/boot_snapshot HTTP endpoint the diagnostic view calls.
+    mode = "pi_hybrid" if platform == "pi" else "mac_hybrid"
+    stt_model_path = Path.home() / ".herbert" / "models" / "ggml-base.en-q5_1.bin"
+    tts_voice_path = (
+        Path.home() / ".herbert" / "voices" / "en_US-lessac-medium.onnx"
+        if config.tts.provider == "piper"
+        else None
+    )
+
+    def _snapshot_provider() -> dict[str, Any]:
+        assembled = persona_cache.get_current()
+        if tools:
+            assembled = assembled.rstrip() + TOOLS_PERSONA_ADDENDUM
+        return build_snapshot(
+            config=config,
+            platform=platform,
+            mode=mode,
+            persona_text=assembled,
+            tools=tools,
+            mcp_servers=deps.mcp_servers,
+            beta_headers=tool_betas,
+            stt_model_path=stt_model_path,
+            tts_voice_path=tts_voice_path,
+            ready=daemon.ready,
+        )
+
+    # Register the provider with the web server so /api/boot_snapshot
+    # works. WebServer was built earlier without it; the attribute
+    # assignment is picked up by the endpoint at request time.
+    web_server._snapshot_provider = _snapshot_provider  # type: ignore[attr-defined]
+
+    # One-shot log at boot (captured in the file log regardless of WS
+    # client state — greppable after the fact, doesn't depend on timing).
+    log_snapshot(_snapshot_provider())
 
     # Pre-load models SYNCHRONOUSLY before we enter the event loop. Herbert
     # is meant to stay on between sessions, so paying the one-time model

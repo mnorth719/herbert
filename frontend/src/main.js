@@ -9,7 +9,7 @@ import {
   onTurnStarted,
 } from './transcript.js';
 import { runBootSequence } from './boot.js';
-import { appendLogLine, setView } from './diagnostic.js';
+import { appendLogLine, configureDiagnostic, setView } from './diagnostic.js';
 import { onExchangeLatency, onLatencyMiss } from './latency.js';
 import { connectWs } from './ws.js';
 
@@ -68,6 +68,7 @@ async function main() {
   await runBootSequence();
 
   const token = new URLSearchParams(location.search).get('token') || null;
+  configureDiagnostic({ token });
   const connBadge = document.getElementById('conn');
   const stateBadge = document.getElementById('state');
   const errorBadge = document.getElementById('error-badge');
