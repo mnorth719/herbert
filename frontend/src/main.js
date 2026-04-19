@@ -2,7 +2,7 @@
 // to the character, transcript, boot, diagnostic, and latency modules.
 
 import { Application } from 'pixi.js';
-import { createCharacter } from './state.js';
+import { createHerbert } from './herbert-character.js';
 import {
   clearTranscript,
   onTranscriptDelta,
@@ -25,11 +25,28 @@ async function main() {
   app.canvas.style.imageRendering = 'pixelated';
   stage.appendChild(app.canvas);
 
-  const character = createCharacter();
+  const character = createHerbert();
   app.stage.addChild(character);
+
+  // Fit the character to the stage while keeping chunky pixel scaling.
+  // We designed at a logical 96-pixel scale; pick the largest integer
+  // multiplier that still fits comfortably inside the stage rectangle.
+  // Fit Herbert to the stage. Silhouette spans local y = -42..+32
+  // (antenna + body = 74 total). Scale fills ~60% of the shorter
+  // dimension; the y-anchor puts the silhouette's visual midpoint
+  // (local y = -5) on the stage center so antenna and body have
+  // equal breathing room above and below.
+  const SILHOUETTE_CENTER = -5;
+  const SILHOUETTE_HEIGHT = 74;
+
   const layout = () => {
-    character.x = app.renderer.width / 2;
-    character.y = app.renderer.height / 2;
+    const { width, height } = app.renderer;
+    const maxScaleByHeight = Math.floor((height * 0.6) / SILHOUETTE_HEIGHT);
+    const maxScaleByWidth = Math.floor((width * 0.35) / 72);
+    const scale = Math.max(2, Math.min(maxScaleByHeight, maxScaleByWidth, 8));
+    character.scale.set(scale);
+    character.x = width / 2;
+    character.y = height / 2 - SILHOUETTE_CENTER * scale;
   };
   layout();
   window.addEventListener('resize', layout);
