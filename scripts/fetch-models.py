@@ -1,12 +1,26 @@
 #!/usr/bin/env python3
-"""Download whisper.cpp (and later Piper) model files with SHA256 verification.
+"""Download Herbert's model + voice dependencies with SHA256 verification.
+
+Two artifact kinds, two destination directories:
+
+  models  -> ~/.herbert/models/   (whisper.cpp .bin)
+  voices  -> ~/.herbert/voices/   (Piper .onnx + .onnx.json sidecar)
 
 Run once per machine as part of first-boot setup. Re-runs are idempotent:
 already-present files with matching SHA256 are skipped.
 
-For models whose pinned SHA256 is not yet known (fresh checksum drift from
-huggingface), pass `--trust-on-first-use`; the script prints the observed
-SHA256 so it can be pinned in `MODELS` for future verifications.
+  # Grab everything (default — safe re-runnable shape)
+  uv run python scripts/fetch-models.py --all
+
+  # Just the STT model
+  uv run python scripts/fetch-models.py --model base.en-q5_1
+
+  # Just the Piper fallback voice
+  uv run python scripts/fetch-models.py --voice en_US-lessac-medium
+
+Pins: each spec carries a SHA256 we verify against. For fresh downloads
+whose hash isn't pinned yet, pass --trust-on-first-use; the script prints
+the observed SHA256 so you can pin it in the MODELS / VOICES dicts below.
 """
 
 from __future__ import annotations
@@ -17,7 +31,8 @@ import sys
 import urllib.request
 from pathlib import Path
 
-DEFAULT_DEST = Path.home() / ".herbert" / "models"
+MODELS_DEST = Path.home() / ".herbert" / "models"
+VOICES_DEST = Path.home() / ".herbert" / "voices"
 
 MODELS: dict[str, dict[str, str | None]] = {
     "base.en-q5_1": {
@@ -25,6 +40,23 @@ MODELS: dict[str, dict[str, str | None]] = {
         "url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en-q5_1.bin",
         "sha256": "4baf70dd0d7c4247ba2b81fafd9c01005ac77c2f9ef064e00dcf195d0e2fdd2f",
     },
+}
+
+# Piper voices are shipped as two files (the model + its JSON sidecar).
+# We fetch both per voice; the sidecar is small and checksummed too.
+VOICES: dict[str, list[dict[str, str | None]]] = {
+    "en_US-lessac-medium": [
+        {
+            "filename": "en_US-lessac-medium.onnx",
+            "url": "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx",
+            "sha256": None,
+        },
+        {
+            "filename": "en_US-lessac-medium.onnx.json",
+            "url": "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx.json",
+            "sha256": None,
+        },
+    ],
 }
 
 
@@ -36,10 +68,14 @@ def _sha256(path: Path) -> str:
     return h.hexdigest()
 
 
-def fetch(model: str, dest_dir: Path, *, trust_on_first_use: bool) -> Path:
-    if model not in MODELS:
-        raise SystemExit(f"unknown model {model!r}; known: {sorted(MODELS)}")
-    spec = MODELS[model]
+def _fetch_spec(
+    spec: dict[str, str | None],
+    dest_dir: Path,
+    *,
+    trust_on_first_use: bool,
+    pin_key: str,
+) -> Path:
+    """Download one {filename, url, sha256} entry into `dest_dir`."""
     dest_dir.mkdir(parents=True, exist_ok=True)
     target = dest_dir / spec["filename"]  # type: ignore[operator]
     pinned = spec["sha256"]
@@ -55,7 +91,7 @@ def fetch(model: str, dest_dir: Path, *, trust_on_first_use: bool) -> Path:
             print(f"{target.name}: already present (no pin — run with --trust-on-first-use to pin)")
             if trust_on_first_use:
                 print(f"  observed SHA256: {observed}")
-                _pin_hint(model, observed)
+                _pin_hint(pin_key, target.name, observed)
             return target
 
     print(f"Fetching {spec['url']}")
@@ -77,14 +113,36 @@ def fetch(model: str, dest_dir: Path, *, trust_on_first_use: bool) -> Path:
                 f"{target.name}: no pinned SHA256 and --trust-on-first-use not set; refusing."
             )
         print(f"{target.name}: SHA256 observed (pin this): {observed}")
-        _pin_hint(model, observed)
+        _pin_hint(pin_key, target.name, observed)
     return target
 
 
-def _pin_hint(model: str, observed: str) -> None:
+def fetch_model(model: str, dest_dir: Path, *, trust_on_first_use: bool) -> Path:
+    if model not in MODELS:
+        raise SystemExit(f"unknown model {model!r}; known: {sorted(MODELS)}")
+    return _fetch_spec(
+        MODELS[model], dest_dir, trust_on_first_use=trust_on_first_use, pin_key=f"MODELS[{model!r}]"
+    )
+
+
+def fetch_voice(voice: str, dest_dir: Path, *, trust_on_first_use: bool) -> list[Path]:
+    if voice not in VOICES:
+        raise SystemExit(f"unknown voice {voice!r}; known: {sorted(VOICES)}")
+    return [
+        _fetch_spec(
+            spec,
+            dest_dir,
+            trust_on_first_use=trust_on_first_use,
+            pin_key=f"VOICES[{voice!r}][{i}]",
+        )
+        for i, spec in enumerate(VOICES[voice])
+    ]
+
+
+def _pin_hint(pin_key: str, filename: str, observed: str) -> None:
     print(
         f"\n  To pin: edit scripts/fetch-models.py and set\n"
-        f"    MODELS[{model!r}]['sha256'] = {observed!r}\n"
+        f"    {pin_key}['sha256'] = {observed!r}  # for {filename}\n"
     )
 
 
@@ -92,23 +150,51 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0] if __doc__ else None)
     parser.add_argument(
         "--model",
-        default="base.en-q5_1",
         choices=sorted(MODELS),
-        help="Model identifier to fetch (default: base.en-q5_1).",
+        help="Whisper model identifier to fetch.",
     )
     parser.add_argument(
-        "--dest",
+        "--voice",
+        choices=sorted(VOICES),
+        help="Piper voice identifier to fetch.",
+    )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Fetch the default model + voice (base.en-q5_1 + en_US-lessac-medium).",
+    )
+    parser.add_argument(
+        "--models-dest",
         type=Path,
-        default=DEFAULT_DEST,
-        help=f"Destination directory (default: {DEFAULT_DEST}).",
+        default=MODELS_DEST,
+        help=f"Model destination directory (default: {MODELS_DEST}).",
+    )
+    parser.add_argument(
+        "--voices-dest",
+        type=Path,
+        default=VOICES_DEST,
+        help=f"Voice destination directory (default: {VOICES_DEST}).",
     )
     parser.add_argument(
         "--trust-on-first-use",
         action="store_true",
-        help="Accept a freshly-downloaded model whose SHA256 is not yet pinned.",
+        help="Accept a freshly-downloaded file whose SHA256 is not yet pinned.",
     )
     args = parser.parse_args(argv)
-    fetch(args.model, args.dest, trust_on_first_use=args.trust_on_first_use)
+
+    # If nothing specific requested, default to fetching the primary model
+    # (preserves the earlier single-flag behaviour for existing users).
+    if not any([args.model, args.voice, args.all]):
+        args.model = "base.en-q5_1"
+
+    if args.all:
+        args.model = args.model or "base.en-q5_1"
+        args.voice = args.voice or "en_US-lessac-medium"
+
+    if args.model:
+        fetch_model(args.model, args.models_dest, trust_on_first_use=args.trust_on_first_use)
+    if args.voice:
+        fetch_voice(args.voice, args.voices_dest, trust_on_first_use=args.trust_on_first_use)
     return 0
 
 

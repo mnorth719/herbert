@@ -29,6 +29,7 @@ import wave
 from pathlib import Path
 
 DEFAULT_MODEL = Path.home() / ".herbert" / "models" / "ggml-base.en-q5_1.bin"
+DEFAULT_PIPER_VOICE = Path.home() / ".herbert" / "voices" / "en_US-lessac-medium.onnx"
 DEFAULT_PERSONA = (
     "You are Herbert, a retro-futurist home companion. Reply in one or two "
     "short sentences — friendly, a little dry, not a lecture."
@@ -108,8 +109,10 @@ async def _speak(
     transcript: str,
     persona: str,
     anthropic_key: str,
-    eleven_key: str,
-    voice_id: str,
+    tts_backend: str,
+    eleven_key: str | None,
+    voice_id: str | None,
+    piper_voice_path: Path,
     model: str,
     output_device: str | None,
 ) -> None:
@@ -119,7 +122,6 @@ async def _speak(
     from herbert.llm.claude import LlmTurnState, stream_turn
     from herbert.session import InMemorySession
     from herbert.tts import TtsState
-    from herbert.tts.elevenlabs_stream import ElevenLabsProvider
 
     # Set the api key for the Anthropic client via env — the SDK reads it
     os.environ["ANTHROPIC_API_KEY"] = anthropic_key
@@ -148,7 +150,20 @@ async def _speak(
                 f"total={llm_state.total_ms}ms"
             )
 
-    tts = ElevenLabsProvider(api_key=eleven_key, voice_id=voice_id)
+    if tts_backend == "elevenlabs":
+        from herbert.tts.elevenlabs_stream import ElevenLabsProvider
+
+        assert eleven_key and voice_id  # _load_keys validates this
+        tts = ElevenLabsProvider(api_key=eleven_key, voice_id=voice_id)
+        print(f"[tts] using elevenlabs voice_id={voice_id}")
+    elif tts_backend == "piper":
+        from herbert.tts.piper import PiperProvider
+
+        tts = PiperProvider(voice_path=piper_voice_path)
+        print(f"[tts] using piper voice {piper_voice_path}")
+    else:
+        raise SystemExit(f"unknown --tts {tts_backend!r}")
+
     tts_state = TtsState()
     audio_out = SounddeviceAudioOut(device_name=output_device)
 
@@ -167,28 +182,45 @@ async def _speak(
     await audio_out.play(_pcm_with_log(), sample_rate=tts.sample_rate)
 
 
-def _load_keys(cli_voice_id: str | None) -> tuple[str, str, str]:
+def _load_keys(
+    cli_voice_id: str | None, tts_backend: str
+) -> tuple[str, str | None, str | None]:
+    """Return (anthropic_key, eleven_key or None, voice_id or None).
+
+    ANTHROPIC_API_KEY is always required. ElevenLabs credentials are only
+    required when --tts=elevenlabs.
+    """
     from herbert.secrets import MissingSecretError, load_secrets
 
     store = load_secrets(Path.home() / ".herbert" / "secrets.env")
     try:
         anthropic = store.require("ANTHROPIC_API_KEY")
+    except MissingSecretError as exc:
+        raise SystemExit(str(exc)) from exc
+
+    if tts_backend != "elevenlabs":
+        return anthropic, None, None
+
+    try:
         eleven = store.require("ELEVENLABS_API_KEY")
     except MissingSecretError as exc:
         raise SystemExit(str(exc)) from exc
-    voice_id = cli_voice_id or store.get("ELEVENLABS_VOICE_ID") or os.environ.get("ELEVENLABS_VOICE_ID")
+    voice_id = (
+        cli_voice_id or store.get("ELEVENLABS_VOICE_ID") or os.environ.get("ELEVENLABS_VOICE_ID")
+    )
     if not voice_id:
         raise SystemExit(
             "ELEVENLABS_VOICE_ID not set. Either:\n"
             "  1) add ELEVENLABS_VOICE_ID=<id> to ~/.herbert/secrets.env\n"
             "  2) export ELEVENLABS_VOICE_ID=<id>\n"
-            "  3) pass --voice-id <id>"
+            "  3) pass --voice-id <id>\n"
+            "  4) switch to offline: --tts piper"
         )
     return anthropic, eleven, voice_id
 
 
 async def _main_async(args: argparse.Namespace) -> None:
-    anthropic, eleven, voice_id = _load_keys(args.voice_id)
+    anthropic, eleven, voice_id = _load_keys(args.voice_id, args.tts)
 
     if args.text:
         transcript = args.text
@@ -211,8 +243,10 @@ async def _main_async(args: argparse.Namespace) -> None:
         transcript,
         args.persona,
         anthropic_key=anthropic,
+        tts_backend=args.tts,
         eleven_key=eleven,
         voice_id=voice_id,
+        piper_voice_path=Path(args.piper_voice),
         model=args.model_llm,
         output_device=args.output_device,
     )
@@ -226,7 +260,18 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--model", default=str(DEFAULT_MODEL), help=f"Whisper model path (default: {DEFAULT_MODEL})")
     p.add_argument("--model-llm", default="claude-haiku-4-5", help="Claude model id")
     p.add_argument("--persona", default=DEFAULT_PERSONA, help="System prompt")
+    p.add_argument(
+        "--tts",
+        choices=["elevenlabs", "piper"],
+        default="elevenlabs",
+        help="TTS backend (default: elevenlabs; piper runs fully offline)",
+    )
     p.add_argument("--voice-id", default=None, help="ElevenLabs voice id (or set ELEVENLABS_VOICE_ID)")
+    p.add_argument(
+        "--piper-voice",
+        default=str(DEFAULT_PIPER_VOICE),
+        help=f"Piper .onnx voice path (default: {DEFAULT_PIPER_VOICE})",
+    )
     p.add_argument("--input-device", default=None, help="Input device name substring")
     p.add_argument("--output-device", default=None, help="Output device name substring")
     src = p.add_mutually_exclusive_group()
