@@ -46,10 +46,12 @@ from pathlib import Path
 from typing import Any
 
 from herbert.config import HerbertConfig
-from herbert.errors import classify_error
+from herbert.errors import classify_error, is_retryable
 from herbert.events import (
     AsyncEventBus,
     ErrorOccurred,
+    ExchangeLatency,
+    LatencyMiss,
     TranscriptDelta,
     TurnCompleted,
     TurnStarted,
@@ -123,6 +125,10 @@ class Daemon:
         self._current_task: asyncio.Task[None] | None = None
         self._stopping = asyncio.Event()
         self._bus_forward_task: asyncio.Task[None] | None = None
+        self._recovery_task: asyncio.Task[None] | None = None
+        # Mode label that shows up on every TurnStarted / ExchangeLatency
+        # event. Used by the R6 ceiling lookup in `TurnSpan.evaluate_ceilings`.
+        self._mode = "pi_hybrid" if deps.hal.platform == "pi" else "mac_hybrid"
 
     @property
     def state(self) -> str:
@@ -149,6 +155,12 @@ class Daemon:
                     self._on_press_ended()
         finally:
             await self._cancel_current_turn(reason="daemon shutdown")
+            if self._recovery_task is not None and not self._recovery_task.done():
+                self._recovery_task.cancel()
+                try:
+                    await self._recovery_task
+                except asyncio.CancelledError:
+                    pass
             if self._bus_forward_task is not None:
                 self._bus_forward_task.cancel()
                 try:
@@ -180,10 +192,15 @@ class Daemon:
 
     async def _on_press_started(self) -> None:
         await self._cancel_current_turn(reason="barge-in")
+        # Any outstanding recovery monitor is moot the instant the user
+        # presses — they're retrying manually, and we don't want two
+        # concurrent paths out of the error state.
+        if self._recovery_task is not None and not self._recovery_task.done():
+            self._recovery_task.cancel()
         turn = Turn()
         self._current_turn = turn
         await self._state.transition("listening", turn_id=turn.turn_id)
-        await self._deps.bus.publish(TurnStarted(turn_id=turn.turn_id, mode="mac_hybrid"))
+        await self._deps.bus.publish(TurnStarted(turn_id=turn.turn_id, mode=self._mode))
         self._current_task = asyncio.create_task(self._run_turn(turn))
 
     def _on_press_ended(self) -> None:
@@ -237,6 +254,7 @@ class Daemon:
     async def _run_turn(self, turn: Turn) -> None:
         """Drive STT → LLM → TTS → Playback for a single exchange."""
         audio_in: AudioIn = self._deps.hal.audio_in
+        turn_start = asyncio.get_running_loop().time()
         try:
             pcm = await audio_in.capture_until_released(turn.release_event)
             await self._state.transition("thinking", turn_id=turn.turn_id)
@@ -245,6 +263,7 @@ class Daemon:
             if not transcript.strip():
                 log.info("empty transcript; skipping LLM call")
                 await self._state.transition("idle", turn_id=turn.turn_id)
+                await self._finalize_and_publish_latency(turn, turn_start)
                 await self._publish_turn_completed(turn, outcome="success")
                 return
             await self._deps.bus.publish(
@@ -252,6 +271,7 @@ class Daemon:
             )
             await self._run_llm_and_speak(turn)
             await self._state.transition("idle", turn_id=turn.turn_id)
+            await self._finalize_and_publish_latency(turn, turn_start)
             await self._publish_turn_completed(turn, outcome="success")
         except asyncio.CancelledError:
             log.info("turn %s cancelled", turn.turn_id)
@@ -331,10 +351,87 @@ class Daemon:
         )
         await self._state.transition_to_error(turn_id=turn.turn_id)
         await self._publish_turn_completed(turn, outcome="error")
+        if is_retryable(klass):
+            # Kick off a background monitor that pings the network at
+            # 1→2→5→10s and transitions back to idle if connectivity
+            # recovers. Non-retryable classes (auth, policy) stay put
+            # until the user presses again.
+            self._recovery_task = asyncio.create_task(
+                self._monitor_recovery(turn.turn_id)
+            )
+
+    async def _monitor_recovery(self, turn_id: str) -> None:
+        """Poll for network recovery after a retryable error; on success,
+        transition error → idle so the user can PTT again without having
+        to "kick" Herbert first.
+
+        If a new turn starts (user presses the button) or the state leaves
+        `error` for any other reason, we stop early. Delays of 1/2/5/10s
+        match plan R16.
+        """
+        delays = (1.0, 2.0, 5.0, 10.0)
+        for delay in delays:
+            try:
+                await asyncio.sleep(delay)
+            except asyncio.CancelledError:
+                return
+            if self._state.state != "error":
+                return  # user pressed the button or daemon shut down
+            if await self._probe_network_ok():
+                await self._state.transition("idle", turn_id=turn_id)
+                log.info("network recovered after error; back to idle")
+                return
+        log.info("recovery monitor exhausted; staying in error until button")
+
+    async def _probe_network_ok(self) -> bool:
+        """Tiny HEAD against Anthropic — fast, auth-independent signal."""
+        try:
+            import httpx
+
+            async with httpx.AsyncClient(timeout=2.0) as client:
+                r = await client.head("https://api.anthropic.com/")
+                return r.status_code < 500
+        except Exception:
+            return False
 
     async def _publish_turn_completed(self, turn: Turn, outcome: str) -> None:
         await self._deps.bus.publish(
             TurnCompleted(turn_id=turn.turn_id, outcome=outcome)  # type: ignore[arg-type]
+        )
+
+    async def _finalize_and_publish_latency(self, turn: Turn, turn_start: float) -> None:
+        """Finalize TurnSpan, emit LatencyMiss per missed stage, ExchangeLatency total.
+
+        Called only on the success + empty-transcript paths (cancelled and
+        errored turns have incomplete stage data and don't need R6 review).
+        """
+        loop = asyncio.get_running_loop()
+        turn.span.total_ms = int((loop.time() - turn_start) * 1000)
+        misses = turn.span.evaluate_ceilings(self._mode)
+        providers = {
+            "stt": self._deps.config.stt.provider,
+            "tts": self._deps.config.tts.provider,
+            "llm": self._deps.config.llm.model,
+        }
+        for stage, actual, ceiling in misses:
+            await self._deps.bus.publish(
+                LatencyMiss(
+                    turn_id=turn.turn_id,
+                    stage=stage,
+                    actual_ms=actual,
+                    ceiling_ms=ceiling,
+                    mode=self._mode,
+                    providers=providers,
+                )
+            )
+        await self._deps.bus.publish(
+            ExchangeLatency(
+                turn_id=turn.turn_id,
+                total_ms=turn.span.total_ms,
+                stage_durations=dict(turn.span.stage_durations),
+                misses=list(turn.span.misses),
+                mode=self._mode,
+            )
         )
 
 
@@ -362,6 +459,7 @@ async def build_and_run(
     from anthropic import AsyncAnthropic
 
     from herbert.hal import build_hal, detect_platform
+    from herbert.health import run_startup_checks
     from herbert.llm.mcp_passthrough import build_mcp_servers
     from herbert.secrets import ensure_frontend_bearer_token, load_secrets
     from herbert.stt.whisper_cpp import WhisperCppProvider
@@ -376,6 +474,14 @@ async def build_and_run(
         output_device_name=config.tts.output_device_name,
     )
     secrets = load_secrets(config.secrets_path)
+
+    # Fire off health checks in parallel while the rest of wiring happens.
+    # Results are logged (and published on the bus) before daemon.run(); a
+    # failing check is diagnostic, not a boot blocker — the secrets fail-closed
+    # handles the truly fatal cases.
+    health_task = asyncio.create_task(
+        run_startup_checks(config, secrets, include_audio=platform != "mock")
+    )
 
     anthropic_key = secrets.require("ANTHROPIC_API_KEY")
     import os as _os
@@ -448,6 +554,25 @@ async def build_and_run(
     daemon = Daemon(deps)
     # Capture the daemon reference so the health provider can read its state
     _daemon_ref["daemon"] = daemon
+
+    # Log the health-check summary before the event loop starts. Results
+    # are visible on the bus as LogLine events and on stderr; failing
+    # checks are diagnostic hints, not boot blockers.
+    try:
+        checks = await asyncio.wait_for(health_task, timeout=8.0)
+        for check in checks:
+            level = logging.INFO if check.ok else logging.WARNING
+            log.log(
+                level,
+                "health %s: %s (%dms) — %s",
+                check.name,
+                "ok" if check.ok else "FAIL",
+                check.duration_ms,
+                check.message,
+            )
+    except TimeoutError:
+        log.warning("startup health checks timed out after 8s")
+
     try:
         await daemon.run()
     finally:

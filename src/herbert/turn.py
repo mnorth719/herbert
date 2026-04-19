@@ -20,6 +20,31 @@ from datetime import UTC, datetime
 from herbert.llm.claude import LlmTurnState
 from herbert.tts import TtsState
 
+# Per-mode R6 ceilings (milliseconds). A turn that exceeds the ceiling for
+# any stage emits a `LatencyMiss` event at WARN; the whole turn always
+# emits an `ExchangeLatency` event with the full stage map at INFO.
+#
+# Turns that fire web_search / web_fetch / code_execution legitimately
+# blow through these ceilings — the miss is real but expected. We still
+# record it so the corner badge surfaces the slow turn; Matt can distinguish
+# tool-use misses from infrastructure misses by reading the transcript.
+R6_CEILINGS: dict[str, dict[str, int]] = {
+    "mac_hybrid": {
+        "stt": 1500,
+        "llm_ttft": 1000,
+        "first_sentence": 1200,
+        "tts_ttfb": 500,
+        "total": 3500,
+    },
+    "pi_hybrid": {
+        "stt": 1200,
+        "llm_ttft": 600,
+        "first_sentence": 1000,
+        "tts_ttfb": 300,
+        "total": 2500,
+    },
+}
+
 
 def _mini_ulid() -> str:
     """Cheap time-ordered id without adding a ULID dep (ulid-py is available but
@@ -44,6 +69,26 @@ class TurnSpan:
     def mark_miss(self, stage: str) -> None:
         if stage not in self.misses:
             self.misses.append(stage)
+
+    def evaluate_ceilings(self, mode: str) -> list[tuple[str, int, int]]:
+        """Return `(stage, actual_ms, ceiling_ms)` for each stage that missed.
+
+        Also populates `self.misses` so the ExchangeLatency event carries
+        the full list. `total` is evaluated against `total_ms` (set by the
+        daemon just before this call); other stages use `stage_durations`.
+        """
+        ceilings = R6_CEILINGS.get(mode)
+        if ceilings is None:
+            return []
+        misses: list[tuple[str, int, int]] = []
+        for stage, ceiling in ceilings.items():
+            actual = self.total_ms if stage == "total" else self.stage_durations.get(stage)
+            if actual is None:
+                continue
+            if actual > ceiling:
+                self.mark_miss(stage)
+                misses.append((stage, actual, ceiling))
+        return misses
 
 
 @dataclass
