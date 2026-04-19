@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import logging
 import random
+import re
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
@@ -82,6 +83,51 @@ _TOOL_USE_FILLERS: tuple[str, ...] = (
 # `server_tool_use` (our use case with web_search) and the legacy
 # `tool_use` label are accepted for forward-compat with client tools.
 _TOOL_USE_BLOCK_TYPES = frozenset({"server_tool_use", "tool_use"})
+
+
+# --- Token-boundary artifact repair ----------------------------------------
+#
+# Claude's BPE tokenizer occasionally splits a word at a subword boundary and
+# emits the pieces as separate streaming deltas with spurious whitespace
+# between them. The SDK's own `text_stream` concatenates deltas verbatim
+# (same as we do), so the artifacts survive into the session content and get
+# read aloud by TTS — "b oredom", "wasn 't", "day —butter".
+#
+# We run a targeted repair at SentenceBuffer flush time. Each pattern below
+# fixes one observed failure mode without over-reaching into legitimate text.
+# If a repair ever does fire on legitimate content, log an INFO so we can
+# tune the pattern.
+
+# Space before a contraction suffix: "wasn 't" -> "wasn't", "it 'll" -> "it'll"
+_RE_CONTRACTION = re.compile(
+    r"(\w)\s+(['\u2019](?:t|s|d|ll|re|ve|m|em))\b",
+    flags=re.IGNORECASE,
+)
+
+# Em-dash / en-dash preceded by whitespace when the following side has none:
+# "day —butter" -> "day—butter". If both sides have whitespace (real prose
+# usage) we leave it alone.
+_RE_ORPHAN_EMDASH = re.compile(r"\s+([\u2014\u2013])(?=\w)")
+
+# Single stranded letter between spaces (not 'a' or 'I' which stand alone
+# legitimately in English). Glues to the word that follows:
+# "sheer b oredom" -> "sheer boredom". The letter must be lower- or
+# upper-case but neither "a"/"A" nor "i"/"I"; the following token must be at
+# least two lowercase letters so we don't glue to a proper noun.
+_RE_STRANDED_LETTER = re.compile(
+    r"(\s)([b-hj-zB-HJ-Z])\s+([a-z]{2,})"
+)
+
+
+def repair_token_artifacts(text: str) -> str:
+    """Patch known Claude streaming tokenizer artifacts in a completed sentence."""
+    before = text
+    text = _RE_CONTRACTION.sub(r"\1\2", text)
+    text = _RE_ORPHAN_EMDASH.sub(r"\1", text)
+    text = _RE_STRANDED_LETTER.sub(r"\1\2\3", text)
+    if text != before:
+        log.debug("repaired token artifacts: %r -> %r", before, text)
+    return text
 
 
 class LlmClientProtocol(Protocol):
@@ -127,14 +173,14 @@ class SentenceBuffer:
 
     def feed(self, text: str) -> list[str]:
         self._buffer += text
-        return self._extract_ready()
+        return [repair_token_artifacts(s) for s in self._extract_ready()]
 
     def flush(self) -> list[str]:
         """Return the remaining buffer as one final sentence (if non-empty)."""
         remaining = self._buffer.strip()
         self._buffer = ""
         self._in_quote = False
-        return [remaining] if remaining else []
+        return [repair_token_artifacts(remaining)] if remaining else []
 
     def _extract_ready(self) -> list[str]:
         results: list[str] = []
