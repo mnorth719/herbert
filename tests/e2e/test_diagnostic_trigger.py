@@ -1,25 +1,14 @@
-"""Voice-triggered diagnostic view.
-
-Unit 7 does NOT implement the regex trigger — that lands in Unit 12 with
-`persona.py` / `diagnostic/triggers.py`. These scenarios are written now
-so Unit 12's "done" is simply `pytest tests/e2e/` green with the xfails
-flipping to passes.
-"""
+"""Voice-triggered diagnostic view — Unit 12."""
 
 from __future__ import annotations
 
-import pytest
-
+from herbert.events import ViewChanged
 from tests.e2e.replay_transport import LlmDelta, TimelineEvent
 
 
-@pytest.mark.xfail(reason="diagnostic trigger regex lands in Unit 12")
 async def test_herbert_show_me_the_logs_flips_view(run_scenario) -> None:  # type: ignore[no-untyped-def]
-    # When Unit 12 lands: daemon should intercept the transcript BEFORE
-    # the LLM call, publish ViewChanged(view="diagnostic"), and NOT touch
-    # the session. Until then, this fixture drives through the LLM as
-    # normal and the test fails — which is the xfail we want.
-    daemon, _, _ = await run_scenario(
+    """The matched utterance should short-circuit the LLM + flip the view."""
+    daemon, result, _ = await run_scenario(
         stt_text="herbert show me the logs",
         llm_script=[LlmDelta(t_ms=50, text="This should not be called.")],
         timeline=[
@@ -28,8 +17,14 @@ async def test_herbert_show_me_the_logs_flips_view(run_scenario) -> None:  # typ
         ],
         timeout_s=3.0,
     )
-    # Post-Unit-12 expectation: session unchanged, view switched to diagnostic
+    # Session is untouched — no LLM turn happened
     assert daemon.session.messages == []
+    # A ViewChanged(view="diagnostic") fired
+    view_events = [e for e in result.all_events if isinstance(e, ViewChanged)]
+    assert len(view_events) == 1
+    assert view_events[0].view == "diagnostic"
+    # The turn completed (didn't error)
+    assert result.turn_completes[0].outcome == "success"
 
 
 async def test_false_positive_lets_llm_run(run_scenario) -> None:  # type: ignore[no-untyped-def]

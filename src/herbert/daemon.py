@@ -40,12 +40,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from herbert.config import HerbertConfig
+from herbert.diagnostic import match as match_diagnostic_trigger
 from herbert.errors import classify_error, is_retryable
 from herbert.events import (
     AsyncEventBus,
@@ -55,6 +56,7 @@ from herbert.events import (
     TranscriptDelta,
     TurnCompleted,
     TurnStarted,
+    ViewChanged,
 )
 from herbert.hal import AudioIn, AudioOut, EventSource, Hal, PressEnded, PressStarted
 from herbert.llm.claude import stream_turn
@@ -99,7 +101,13 @@ Style:
 
 @dataclass
 class DaemonDeps:
-    """Everything the daemon needs, bundled for easy injection in tests."""
+    """Everything the daemon needs, bundled for easy injection in tests.
+
+    `persona` accepts either a static `str` (test-friendly) or a callable
+    that returns the current persona text (production path, backed by
+    `PersonaCache` for hot-reload). The daemon resolves it per turn and
+    appends `TOOLS_PERSONA_ADDENDUM` when tools are active.
+    """
 
     config: HerbertConfig
     bus: AsyncEventBus
@@ -107,7 +115,7 @@ class DaemonDeps:
     stt: SttProvider
     tts: TtsProvider
     llm_client: Any  # anthropic.AsyncAnthropic or a stub
-    persona: str
+    persona: str | Callable[[], str]
     mcp_servers: list[dict[str, str]] | None = None
     tools: list[dict[str, Any]] | None = None
     beta_headers: list[str] | None = None
@@ -126,6 +134,7 @@ class Daemon:
         self._stopping = asyncio.Event()
         self._bus_forward_task: asyncio.Task[None] | None = None
         self._recovery_task: asyncio.Task[None] | None = None
+        self._transcript_log_task: asyncio.Task[None] | None = None
         # Mode label that shows up on every TurnStarted / ExchangeLatency
         # event. Used by the R6 ceiling lookup in `TurnSpan.evaluate_ceilings`.
         self._mode = "pi_hybrid" if deps.hal.platform == "pi" else "mac_hybrid"
@@ -153,6 +162,11 @@ class Daemon:
         log.info("daemon ready, listening for button events")
         if self._deps.web_server is not None:
             self._bus_forward_task = asyncio.create_task(self._forward_bus_to_web())
+        # Optional transcript audit log — gated by config.logging.log_transcripts.
+        # Writes user/assistant lines to the file log for easy `grep` after the fact.
+        self._transcript_log_task: asyncio.Task[None] | None = None
+        if self._deps.config.logging.log_transcripts:
+            self._transcript_log_task = asyncio.create_task(self._log_transcripts())
         events = source.events()
         try:
             async for event in events:
@@ -176,7 +190,31 @@ class Daemon:
                     await self._bus_forward_task
                 except asyncio.CancelledError:
                     pass
+            if self._transcript_log_task is not None and not self._transcript_log_task.done():
+                self._transcript_log_task.cancel()
+                try:
+                    await self._transcript_log_task
+                except asyncio.CancelledError:
+                    pass
             await source.close()
+
+    async def _log_transcripts(self) -> None:
+        """Subscribe to TranscriptDelta events and append them to the file log.
+
+        Gated by `config.logging.log_transcripts`. Per-sentence for the
+        assistant side, one line per user-utterance. Safe to cancel — the
+        subscription unregisters cleanly on exit.
+        """
+        async with self._deps.bus.subscribe() as sub:
+            while True:
+                event = await sub.receive()
+                if isinstance(event, TranscriptDelta):
+                    log.info(
+                        "transcript turn=%s role=%s text=%r",
+                        event.turn_id,
+                        event.role,
+                        event.text.strip(),
+                    )
 
     async def _forward_bus_to_web(self) -> None:
         """Subscribe to the bus and forward every event to the web thread.
@@ -275,6 +313,15 @@ class Daemon:
                 await self._finalize_and_publish_latency(turn, turn_start)
                 await self._publish_turn_completed(turn, outcome="success")
                 return
+
+            # Diagnostic-mode voice trigger — short-circuits the LLM path.
+            # The user's utterance is shown in the transcript but never
+            # appended to the session (no real conversation happened).
+            trigger = match_diagnostic_trigger(transcript)
+            if trigger is not None:
+                await self._handle_diagnostic_trigger(turn, turn_start, trigger)
+                return
+
             await self._deps.bus.publish(
                 TranscriptDelta(turn_id=turn.turn_id, role="user", text=transcript)
             )
@@ -296,6 +343,42 @@ class Daemon:
         turn.span.record("stt", result.duration_ms)
         return result.text
 
+    def _resolve_persona(self) -> str:
+        """Resolve the persona string for this turn.
+
+        `DaemonDeps.persona` may be a static string (tests) or a callable
+        (production PersonaCache). We fetch fresh text per turn so mid-
+        session edits to `~/.herbert/persona.md` take effect next turn.
+        `TOOLS_PERSONA_ADDENDUM` is appended when tools are active so the
+        addendum text isn't baked into cache and doesn't get duplicated.
+        """
+        from herbert.llm.tools import TOOLS_PERSONA_ADDENDUM
+
+        source = self._deps.persona
+        base = source() if callable(source) else source
+        if self._deps.tools:
+            return base.rstrip() + TOOLS_PERSONA_ADDENDUM
+        return base
+
+    async def _handle_diagnostic_trigger(
+        self, turn: Turn, turn_start: float, trigger: str
+    ) -> None:
+        """Short-circuit the pipeline when the STT result matched a trigger phrase.
+
+        Surfaces what the user said in the transcript (so they can see the
+        match happened), publishes a `ViewChanged`, and returns to idle
+        without ever calling Claude or touching the session.
+        """
+        await self._deps.bus.publish(
+            TranscriptDelta(turn_id=turn.turn_id, role="user", text=turn.transcript)
+        )
+        view = "diagnostic" if trigger == "enter_diagnostic" else "character"
+        await self._deps.bus.publish(ViewChanged(turn_id=turn.turn_id, view=view))
+        log.info("diagnostic trigger %r → view=%s", trigger, view)
+        await self._state.transition("idle", turn_id=turn.turn_id)
+        await self._finalize_and_publish_latency(turn, turn_start)
+        await self._publish_turn_completed(turn, outcome="success")
+
     async def _run_llm_and_speak(self, turn: Turn) -> None:
         tts: TtsProvider = self._deps.tts
         audio_out: AudioOut = self._deps.hal.audio_out
@@ -304,7 +387,7 @@ class Daemon:
         raw_sentences = stream_turn(
             turn.transcript,
             self._session,
-            self._deps.persona,
+            self._resolve_persona(),
             client=self._deps.llm_client,
             model=self._deps.config.llm.model,
             max_tokens=self._deps.config.llm.max_tokens,
@@ -447,12 +530,6 @@ class Daemon:
 # --- Factory + CLI entry -----------------------------------------------------
 
 
-def _load_persona(path: Path) -> str:
-    if not path.exists():
-        return DEFAULT_PERSONA
-    return path.read_text()
-
-
 async def build_and_run(
     config: HerbertConfig,
     *,
@@ -529,11 +606,8 @@ async def build_and_run(
     web_server.start()
     log.info("web server listening on %s (expose=%s)", web_server.url, effective_expose)
 
-    from herbert.llm.tools import (
-        TOOLS_PERSONA_ADDENDUM,
-        build_tool_beta_headers,
-        build_tools,
-    )
+    from herbert.llm.tools import build_tool_beta_headers, build_tools
+    from herbert.persona import PersonaCache
 
     tools = build_tools(
         web_search_enabled=config.llm.web_search_enabled,
@@ -544,9 +618,11 @@ async def build_and_run(
         web_fetch_enabled=config.llm.web_fetch_enabled,
         code_execution_enabled=config.llm.code_execution_enabled,
     )
-    persona = _load_persona(config.persona_path)
-    if tools:
-        persona = persona.rstrip() + TOOLS_PERSONA_ADDENDUM
+    # PersonaCache handles hot-reload + last-good-cached fallback. Priming
+    # here raises PersonaMissingError if the file exists but is unreadable
+    # or empty — the user is told loudly at boot rather than on first turn.
+    persona_cache = PersonaCache(config.persona_path, default=DEFAULT_PERSONA)
+    persona_cache.prime_at_startup()
 
     deps = DaemonDeps(
         config=config,
@@ -555,7 +631,7 @@ async def build_and_run(
         stt=stt,
         tts=tts,
         llm_client=llm_client,
-        persona=persona,
+        persona=persona_cache.get_current,  # callable — daemon resolves per turn
         mcp_servers=build_mcp_servers(config.mcp) or None,
         tools=tools or None,
         beta_headers=tool_betas or None,
