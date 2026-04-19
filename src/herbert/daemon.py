@@ -46,7 +46,6 @@ from pathlib import Path
 from typing import Any
 
 from herbert.config import HerbertConfig
-from herbert.diagnostic import match as match_diagnostic_trigger
 from herbert.errors import classify_error, is_retryable
 from herbert.events import (
     AsyncEventBus,
@@ -56,10 +55,10 @@ from herbert.events import (
     TranscriptDelta,
     TurnCompleted,
     TurnStarted,
-    ViewChanged,
 )
 from herbert.hal import AudioIn, AudioOut, EventSource, Hal, PressEnded, PressStarted
 from herbert.llm.claude import stream_turn
+from herbert.llm.local_tools import LocalToolDispatcher
 from herbert.session import InMemorySession, Message, Session
 from herbert.state import StateMachine
 from herbert.stt import SttProvider
@@ -314,14 +313,6 @@ class Daemon:
                 await self._publish_turn_completed(turn, outcome="success")
                 return
 
-            # Diagnostic-mode voice trigger — short-circuits the LLM path.
-            # The user's utterance is shown in the transcript but never
-            # appended to the session (no real conversation happened).
-            trigger = match_diagnostic_trigger(transcript)
-            if trigger is not None:
-                await self._handle_diagnostic_trigger(turn, turn_start, trigger)
-                return
-
             await self._deps.bus.publish(
                 TranscriptDelta(turn_id=turn.turn_id, role="user", text=transcript)
             )
@@ -360,24 +351,6 @@ class Daemon:
             return base.rstrip() + TOOLS_PERSONA_ADDENDUM
         return base
 
-    async def _handle_diagnostic_trigger(
-        self, turn: Turn, turn_start: float, trigger: str
-    ) -> None:
-        """Short-circuit the pipeline when the STT result matched a trigger phrase.
-
-        Surfaces what the user said in the transcript (so they can see the
-        match happened), publishes a `ViewChanged`, and returns to idle
-        without ever calling Claude or touching the session.
-        """
-        await self._deps.bus.publish(
-            TranscriptDelta(turn_id=turn.turn_id, role="user", text=turn.transcript)
-        )
-        view = "diagnostic" if trigger == "enter_diagnostic" else "character"
-        await self._deps.bus.publish(ViewChanged(turn_id=turn.turn_id, view=view))
-        log.info("diagnostic trigger %r → view=%s", trigger, view)
-        await self._state.transition("idle", turn_id=turn.turn_id)
-        await self._finalize_and_publish_latency(turn, turn_start)
-        await self._publish_turn_completed(turn, outcome="success")
 
     async def _run_llm_and_speak(self, turn: Turn) -> None:
         tts: TtsProvider = self._deps.tts
@@ -394,6 +367,8 @@ class Daemon:
             mcp_servers=self._deps.mcp_servers,
             tools=self._deps.tools,
             beta_headers=self._deps.beta_headers,
+            local_dispatcher=LocalToolDispatcher(self._deps.bus),
+            turn_id=turn.turn_id,
             state=turn.llm_state,
         )
 

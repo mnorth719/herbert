@@ -1,24 +1,26 @@
-"""Anthropic server-side tool specs + persona addendum + beta headers.
+"""Tool specs + persona addendum + beta headers.
 
-Server tools are executed by Anthropic — we declare them once and the model
-uses them transparently while streaming. For Herbert we enable three:
+Two families of tools, same `tools=[...]` kwarg on the request:
 
-  web_search      best for general "what's the news about X" questions
-  web_fetch       loads a specific URL (pair with search — "go read this page")
-  code_execution  Python sandbox for calculations, API calls, date math
+  Server-side (Anthropic executes them transparently while streaming):
+    web_search        best for general "what's the news about X" questions
+    web_fetch         loads a specific URL (pair with search — "go read this page")
+    code_execution    Python sandbox for calculations, API calls, date math
 
-Each tool adds latency when it fires, but the capability jump vs. model
-knowledge alone is substantial. Cost is per invocation; Claude self-limits
-so we don't cap.
+  Client-side (we execute them via LocalToolDispatcher and feed tool_result
+  back to continue the stream):
+    set_view          switch the frontend between character and diagnostic view
 
-If Anthropic deprecates any of these tool IDs, the API returns a clear
-error on the first request; bumping the version + beta header is a one-line
-fix per tool.
+Server tools add latency when they fire but cost nothing in Herbert code.
+Client tools cost a round-trip per call but let us do local side effects.
+Claude self-limits either way.
 """
 
 from __future__ import annotations
 
 from typing import Any
+
+from herbert.llm.local_tools import ALL_LOCAL_TOOLS
 
 # --- Tool specs -------------------------------------------------------------
 
@@ -51,8 +53,14 @@ def build_tools(
     web_search_enabled: bool,
     web_fetch_enabled: bool = False,
     code_execution_enabled: bool = False,
+    include_local_tools: bool = True,
 ) -> list[dict[str, Any]]:
-    """Assemble the tools list that `messages.stream(tools=...)` wants."""
+    """Assemble the tools list that `messages.stream(tools=...)` wants.
+
+    Server tools come first (Anthropic-executed), then client-side local
+    tools (we execute via LocalToolDispatcher). Order doesn't affect
+    behavior but keeps the list readable in logs.
+    """
     tools: list[dict[str, Any]] = []
     if web_search_enabled:
         tools.append(WEB_SEARCH_TOOL)
@@ -60,6 +68,8 @@ def build_tools(
         tools.append(WEB_FETCH_TOOL)
     if code_execution_enabled:
         tools.append(CODE_EXECUTION_TOOL)
+    if include_local_tools:
+        tools.extend(ALL_LOCAL_TOOLS)
     return tools
 
 
@@ -90,17 +100,20 @@ def build_tool_beta_headers(
 #      daemon injects automatically — Claude must NOT add its own filler.
 TOOLS_PERSONA_ADDENDUM = """
 
-You have three tools available:
+You have four tools available:
 
   - web_search: use for current facts drawn from the broader internet — news, sports, weather, stock prices, recent events, anything that changes week-to-week.
   - web_fetch: use when you need the LIVE contents of a specific page — an official schedule, a reference article, documentation. Prefer search→fetch in combination: search to find the authoritative URL, then fetch that URL to get today's actual data. Snippets from search are often cached and stale; fetch bypasses that.
   - code_execution: use for calculations, date and time math, parsing JSON APIs, running short Python (e.g., hitting a free public API like `statsapi.mlb.com` for sports data, `api.weather.gov` for forecasts, or doing arithmetic on numbers).
+  - set_view: switch the frontend display between 'character' and 'diagnostic'. Call with mode='diagnostic' when Matt asks to see the logs / enter diagnostic mode / debug mode / see the innards — interpret intent, wording varies because of transcription errors. Call with mode='character' when he wants the normal view back. Do NOT call this for factual questions like "show me the logs from yesterday" (that's asking about log content, not switching views).
 
 Pick the lightest tool that answers the question — don't fetch when search alone is enough, don't execute code when a single fetch does it.
 
-IMPORTANT — do NOT write a covering sentence, filler, or acknowledgement before calling any tool. The system automatically plays a short filler out loud the instant you call a tool, so anything you add would duplicate it. Go straight from the user's question to the tool call when one is needed. When the results arrive, reply in one or two short sentences — just the answer, no "okay," no "let me see," no "got it." Start directly with the substance.
+IMPORTANT — do NOT write a covering sentence, filler, or acknowledgement before calling web_search, web_fetch, or code_execution. The system automatically plays a short filler out loud the instant you call a network tool, so anything you add would duplicate it. Go straight from the user's question to the tool call when one is needed. When the results arrive, reply in one or two short sentences — just the answer, no "okay," no "let me see," no "got it." Start directly with the substance.
 
-When you speak the answer: paraphrase in your own words. Never read URLs, page titles, or bracketed citation numbers. If naming a source helps trust (a specific weather service, a team's announcement), say it in plain English like "according to the MLB schedule," never as a link."""
+set_view is local and instant — no filler fires — so a brief acknowledgement ("switching now" or similar) before or after is fine if it reads natural, but you can also just silently flip.
+
+When you speak search / fetch / code answers: paraphrase in your own words. Never read URLs, page titles, or bracketed citation numbers. If naming a source helps trust (a specific weather service, a team's announcement), say it in plain English like "according to the MLB schedule," never as a link."""
 
 
 # Backwards-compat alias — older code imported `WEB_SEARCH_PERSONA_ADDENDUM`

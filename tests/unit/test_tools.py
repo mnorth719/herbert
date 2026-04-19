@@ -14,18 +14,30 @@ from herbert.llm.tools import (
 
 
 class TestBuildTools:
-    def test_all_disabled_returns_empty(self) -> None:
+    def test_all_disabled_returns_empty_when_locals_excluded(self) -> None:
         assert (
             build_tools(
                 web_search_enabled=False,
                 web_fetch_enabled=False,
                 code_execution_enabled=False,
+                include_local_tools=False,
             )
             == []
         )
 
-    def test_web_search_only(self) -> None:
-        tools = build_tools(web_search_enabled=True)
+    def test_locals_included_by_default(self) -> None:
+        # Client-side tools come along unless explicitly excluded — set_view
+        # etc. are considered part of Herbert's baseline capability.
+        tools = build_tools(
+            web_search_enabled=False,
+            web_fetch_enabled=False,
+            code_execution_enabled=False,
+        )
+        names = {t["name"] for t in tools}
+        assert "set_view" in names
+
+    def test_web_search_only_plus_locals(self) -> None:
+        tools = build_tools(web_search_enabled=True, include_local_tools=False)
         assert tools == [WEB_SEARCH_TOOL]
 
     def test_all_enabled_in_order(self) -> None:
@@ -33,6 +45,7 @@ class TestBuildTools:
             web_search_enabled=True,
             web_fetch_enabled=True,
             code_execution_enabled=True,
+            include_local_tools=False,
         )
         assert tools == [WEB_SEARCH_TOOL, WEB_FETCH_TOOL, CODE_EXECUTION_TOOL]
 

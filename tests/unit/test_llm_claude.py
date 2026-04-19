@@ -50,18 +50,55 @@ def _text_events(deltas: list[str]) -> list[_TextDeltaEvent]:
     return [_TextDeltaEvent(d) for d in deltas]
 
 
+class _ToolUseBlock:
+    """Mimics Anthropic's ToolUseBlock for test final-message assertions."""
+
+    type = "tool_use"
+
+    def __init__(self, name: str, tool_input: dict[str, Any], tool_id: str = "toolu_1") -> None:
+        self.name = name
+        self.input = tool_input
+        self.id = tool_id
+
+    def model_dump(self, **_: Any) -> dict[str, Any]:
+        return {"type": "tool_use", "name": self.name, "input": self.input, "id": self.id}
+
+
+class _TextBlock:
+    type = "text"
+
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+    def model_dump(self, **_: Any) -> dict[str, Any]:
+        return {"type": "text", "text": self.text}
+
+
+class _FinalMessage:
+    """Return value of `stream.get_final_message()`."""
+
+    def __init__(self, stop_reason: str = "end_turn", content: list[Any] | None = None) -> None:
+        self.stop_reason = stop_reason
+        self.content = content or []
+
+
 class _StubStream:
     """Stream stub that iterates a scripted list of structured events.
 
-    Accepts either raw event objects (with .type) or bare strings (treated
-    as text deltas, for ergonomic per-test setup). When constructed from the
-    older deltas-only shape, converts on the way in.
+    Pass `events` as either event objects (.type present) or bare strings
+    (treated as text deltas, ergonomic for per-test setup). `final_message`
+    is returned from `get_final_message()` at the end of iteration.
     """
 
-    def __init__(self, events_or_deltas: list[Any]) -> None:
+    def __init__(
+        self,
+        events_or_deltas: list[Any],
+        final_message: _FinalMessage | None = None,
+    ) -> None:
         self._events = [
             e if hasattr(e, "type") else _TextDeltaEvent(e) for e in events_or_deltas
         ]
+        self._final = final_message or _FinalMessage()
         self.entered = False
 
     async def __aenter__(self) -> _StubStream:
@@ -78,20 +115,47 @@ class _StubStream:
 
         return _gen()
 
+    async def get_final_message(self) -> _FinalMessage:
+        return self._final
+
 
 class _StubMessages:
-    def __init__(self, deltas: list[str]) -> None:
-        self._deltas = deltas
+    """Script a sequence of streams. Each `.stream()` call returns the next script.
+
+    `_StubClient(["a", "b"])` is a legacy single-stream shortcut. For
+    tool-use loop tests, pass `scripts=[(events1, final1), (events2, final2)]`.
+    """
+
+    def __init__(
+        self,
+        deltas: list[Any] | None = None,
+        scripts: list[tuple[list[Any], _FinalMessage | None]] | None = None,
+    ) -> None:
+        if scripts is not None:
+            self._scripts = list(scripts)
+        else:
+            self._scripts = [((deltas or []), None)]
         self.last_kwargs: dict[str, Any] = {}
+        self.stream_count = 0
 
     def stream(self, **kwargs: Any) -> _StubStream:
         self.last_kwargs = kwargs
-        return _StubStream(self._deltas)
+        self.stream_count += 1
+        if self._scripts:
+            events, final = self._scripts.pop(0)
+        else:
+            events, final = [], None
+        return _StubStream(events, final_message=final)
 
 
 class _StubClient:
-    def __init__(self, deltas: list[str]) -> None:
-        self.messages = _StubMessages(deltas)
+    def __init__(
+        self,
+        deltas: list[Any] | None = None,
+        *,
+        scripts: list[tuple[list[Any], _FinalMessage | None]] | None = None,
+    ) -> None:
+        self.messages = _StubMessages(deltas=deltas, scripts=scripts)
 
 
 async def _collect(gen: AsyncIterator[str]) -> list[str]:
@@ -320,6 +384,170 @@ class TestToolUseFiller:
         )
         sentences = await _collect(stream_turn("weather?", session, "p", client=client))
         assert sentences == ["Looking.", "In Pasadena it is 72."]
+
+
+class _CapturingDispatcher:
+    """Records calls; returns a canned string as the tool_result content."""
+
+    def __init__(self, result: str = "ok") -> None:
+        self.calls: list[tuple[str, dict[str, Any], str | None]] = []
+        self._result = result
+
+    async def execute(
+        self, name: str, tool_input: dict[str, Any], turn_id: str | None
+    ) -> str:
+        self.calls.append((name, tool_input, turn_id))
+        return self._result
+
+
+class TestToolUseLoop:
+    async def test_client_side_tool_triggers_second_stream_and_continues(self) -> None:
+        """Claude: text + tool_use → we execute → second stream with final text."""
+        session = InMemorySession()
+        tool_block = _ToolUseBlock(
+            name="set_view", tool_input={"mode": "diagnostic"}, tool_id="toolu_view_1"
+        )
+        scripts = [
+            # First request: Claude says a sentence and calls set_view
+            (
+                [_TextDeltaEvent("Switching now. ")],
+                _FinalMessage(
+                    stop_reason="tool_use",
+                    content=[_TextBlock("Switching now. "), tool_block],
+                ),
+            ),
+            # Second request (after tool_result): Claude finishes normally
+            (
+                [_TextDeltaEvent("Done.")],
+                _FinalMessage(stop_reason="end_turn", content=[_TextBlock("Done.")]),
+            ),
+        ]
+        client = _StubClient(scripts=scripts)
+        dispatcher = _CapturingDispatcher()
+        state = LlmTurnState()
+
+        sentences = await _collect(
+            stream_turn(
+                "switch to diagnostic mode",
+                session,
+                "p",
+                client=client,
+                local_dispatcher=dispatcher,
+                turn_id="turn-abc",
+                state=state,
+            )
+        )
+
+        # Yielded sentences span both streams
+        assert sentences == ["Switching now.", "Done."]
+        # Dispatcher was called with the right input + turn_id
+        assert dispatcher.calls == [("set_view", {"mode": "diagnostic"}, "turn-abc")]
+        # Two actual API requests fired
+        assert client.messages.stream_count == 2
+        # Session ends with one consolidated assistant message
+        assert [m.role for m in session.messages] == ["user", "assistant"]
+        assert session.messages[-1].content == "Switching now. Done."
+
+    async def test_unknown_tool_name_breaks_loop(self) -> None:
+        """If Claude hallucinates a tool we don't know, bail rather than loop."""
+        session = InMemorySession()
+        tool_block = _ToolUseBlock(
+            name="never_heard_of_this", tool_input={}, tool_id="toolu_fake"
+        )
+        scripts = [
+            (
+                [_TextDeltaEvent("Working on it.")],
+                _FinalMessage(
+                    stop_reason="tool_use",
+                    content=[_TextBlock("Working on it."), tool_block],
+                ),
+            ),
+        ]
+        client = _StubClient(scripts=scripts)
+        dispatcher = _CapturingDispatcher()
+        state = LlmTurnState()
+
+        sentences = await _collect(
+            stream_turn(
+                "hi", session, "p", client=client,
+                local_dispatcher=dispatcher, turn_id="t1", state=state,
+            )
+        )
+        # We yielded what we got, but the dispatcher never fired and we
+        # didn't loop again — one request only.
+        assert sentences == ["Working on it."]
+        assert dispatcher.calls == []
+        assert client.messages.stream_count == 1
+
+    async def test_no_tool_use_single_stream(self) -> None:
+        """The common case: no tool_use, no second request."""
+        session = InMemorySession()
+        scripts = [
+            (
+                [_TextDeltaEvent("Hi there.")],
+                _FinalMessage(stop_reason="end_turn", content=[_TextBlock("Hi there.")]),
+            ),
+        ]
+        client = _StubClient(scripts=scripts)
+        dispatcher = _CapturingDispatcher()
+        state = LlmTurnState()
+
+        sentences = await _collect(
+            stream_turn(
+                "hi", session, "p", client=client,
+                local_dispatcher=dispatcher, state=state,
+            )
+        )
+        assert sentences == ["Hi there."]
+        assert client.messages.stream_count == 1
+        assert dispatcher.calls == []
+
+    async def test_second_stream_receives_tool_result_in_messages(self) -> None:
+        """The continuation call must carry the assistant tool_use + user tool_result."""
+        session = InMemorySession()
+        tool_block = _ToolUseBlock(
+            name="set_view", tool_input={"mode": "diagnostic"}, tool_id="toolu_xyz"
+        )
+        scripts = [
+            (
+                [],
+                _FinalMessage(stop_reason="tool_use", content=[tool_block]),
+            ),
+            (
+                [_TextDeltaEvent("ok.")],
+                _FinalMessage(stop_reason="end_turn", content=[_TextBlock("ok.")]),
+            ),
+        ]
+        client = _StubClient(scripts=scripts)
+        dispatcher = _CapturingDispatcher(result="view set to diagnostic")
+
+        async for _ in stream_turn(
+            "flip view", session, "p", client=client,
+            local_dispatcher=dispatcher, turn_id="t", state=LlmTurnState(),
+        ):
+            pass
+
+        # Second request's messages should include: prior user turn,
+        # the assistant's tool_use message, and the user's tool_result.
+        second_kwargs = client.messages.last_kwargs
+        msgs = second_kwargs["messages"]
+        roles = [m["role"] for m in msgs]
+        assert roles == ["user", "assistant", "user"]
+        # The assistant message echoes the tool_use block
+        assistant_msg = msgs[1]
+        assert any(
+            b.get("type") == "tool_use" and b.get("id") == "toolu_xyz"
+            for b in assistant_msg["content"]
+        )
+        # The final user message carries the tool_result with matching id
+        tool_result_msg = msgs[2]
+        assert tool_result_msg["content"] == [
+            {
+                "type": "tool_result",
+                "tool_use_id": "toolu_xyz",
+                "content": "view set to diagnostic",
+            }
+        ]
 
 
 class TestCancellation:

@@ -51,6 +51,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
+from herbert.llm.local_tools import LOCAL_TOOL_NAMES, LocalToolDispatcher
 from herbert.llm.mcp_passthrough import MCP_BETA_HEADER
 from herbert.session import Message, Session
 
@@ -79,10 +80,14 @@ _TOOL_USE_FILLERS: tuple[str, ...] = (
     "Interrogating the oracle.",
 )
 
-# Tool-use content-block types we treat as "tool is starting". Both
-# `server_tool_use` (our use case with web_search) and the legacy
-# `tool_use` label are accepted for forward-compat with client tools.
-_TOOL_USE_BLOCK_TYPES = frozenset({"server_tool_use", "tool_use"})
+# Content-block types that trigger the "covering sentence" filler. Only
+# server-side tools get fillers — client-side (local) tools like set_view
+# execute instantly, so no filler is needed or wanted.
+_FILLER_TOOL_BLOCK_TYPES = frozenset({"server_tool_use"})
+
+# Maximum number of client-side tool-use → tool_result round-trips per
+# turn before we break out. Guards against a pathological Claude loop.
+_MAX_TOOL_USE_LOOPS = 6
 
 
 # --- Token-boundary artifact repair ----------------------------------------
@@ -230,7 +235,7 @@ class SentenceBuffer:
 
 
 def _build_stream_kwargs(
-    session: Session,
+    api_messages: list[dict[str, Any]],
     persona: str,
     model: str,
     max_tokens: int,
@@ -240,15 +245,17 @@ def _build_stream_kwargs(
 ) -> tuple[dict[str, Any], dict[str, str] | None]:
     """Split the call into (stream kwargs, extra headers).
 
-    The `anthropic-beta` header value is a comma-separated list of tokens.
-    We collect every token required by the active tools + MCP config into
-    one header so the caller doesn't have to juggle multiple headers.
+    `api_messages` is the full `messages` payload — session history plus
+    any in-flight tool_use/tool_result blocks from the current turn's
+    ongoing tool-use loop. The `anthropic-beta` header collects every
+    token required by active tools + MCP config into one comma-joined
+    value so the caller doesn't juggle headers.
     """
     kwargs: dict[str, Any] = {
         "model": model,
         "max_tokens": max_tokens,
         "system": persona,
-        "messages": [{"role": m.role, "content": m.content} for m in session.messages],
+        "messages": api_messages,
     }
     if tools:
         kwargs["tools"] = tools
@@ -263,6 +270,15 @@ def _build_stream_kwargs(
     return kwargs, extra_headers
 
 
+def _content_block_as_dict(block: Any) -> dict[str, Any]:
+    """Anthropic content blocks are pydantic models; we need plain dicts to
+    echo them back in the next request. `model_dump` covers both `ToolUseBlock`
+    and `TextBlock` shapes; exclude_unset=False keeps required fields present."""
+    if hasattr(block, "model_dump"):
+        return block.model_dump(mode="json", exclude_none=True)  # type: ignore[no-any-return]
+    return dict(block)  # fallback for dict-shaped test stubs
+
+
 async def stream_turn(
     transcript: str,
     session: Session,
@@ -274,70 +290,152 @@ async def stream_turn(
     mcp_servers: list[dict[str, str]] | None = None,
     tools: list[dict[str, Any]] | None = None,
     beta_headers: list[str] | None = None,
+    local_dispatcher: LocalToolDispatcher | None = None,
+    turn_id: str | None = None,
     state: LlmTurnState | None = None,
     word_flush_threshold: int = 20,
 ) -> AsyncIterator[str]:
     """Stream Claude's response, yielding complete sentences as they form.
 
-    Side effects on `session`:
-      - user `Message` appended at the top of the call
-      - assistant `Message` appended after the stream ends normally
+    Handles both Anthropic-executed server tools (transparent) and
+    client-side tools via `local_dispatcher`. Client tools cause the stream
+    to end with `stop_reason='tool_use'`; we execute them, append the
+    `tool_result` to the next request's messages, and call `messages.stream`
+    again. Loops up to `_MAX_TOOL_USE_LOOPS` before giving up.
 
-    On cancellation the caller is responsible for reconciling the session
-    (pop the user message if `state.tokens_received == 0`, otherwise replace
-    the assistant message with a partial + `[interrupted]` marker).
+    Side effects on `session`:
+      - user `Message` appended on entry
+      - assistant `Message` appended on normal completion (concatenated
+        text across all tool-use rounds)
+
+    On cancellation, the caller reconciles the session using `LlmTurnState`
+    (pop user if zero tokens; otherwise mark assistant as `[interrupted]`).
     """
     session.append(Message(role="user", content=transcript))
-    kwargs, extra_headers = _build_stream_kwargs(
-        session, persona, model, max_tokens, mcp_servers, tools, beta_headers
-    )
     buffer = SentenceBuffer(word_flush_threshold=word_flush_threshold)
     start = time.perf_counter()
 
-    # Anthropic's async SDK: `messages.stream()` returns an async context manager.
-    # When MCP beta headers are needed we pass them via `extra_headers`, which the
-    # SDK forwards to the HTTP request.
-    stream_factory = client.messages.stream
-    if extra_headers:
-        stream_cm = stream_factory(**kwargs, extra_headers=extra_headers)
-    else:
-        stream_cm = stream_factory(**kwargs)
+    # Base messages from session history. The tool-use loop appends
+    # assistant+tool_result pairs as it goes so each successive call
+    # carries the full conversation Claude needs to continue.
+    api_messages: list[dict[str, Any]] = [
+        {"role": m.role, "content": m.content} for m in session.messages
+    ]
 
     any_text_emitted = False
 
-    async with stream_cm as stream:
-        async for event in stream:
-            event_type = getattr(event, "type", None)
+    for loop_index in range(_MAX_TOOL_USE_LOOPS):
+        kwargs, extra_headers = _build_stream_kwargs(
+            api_messages, persona, model, max_tokens, mcp_servers, tools, beta_headers
+        )
+        stream_factory = client.messages.stream
+        if extra_headers:
+            stream_cm = stream_factory(**kwargs, extra_headers=extra_headers)
+        else:
+            stream_cm = stream_factory(**kwargs)
 
-            # Tool starting with zero preceding text — inject a covering
-            # sentence locally so the TTS has something to say during the
-            # search. Fires at most once per turn (guarded by any_text_emitted).
-            if (
-                event_type == "content_block_start"
-                and _is_tool_use_start(event)
-                and not any_text_emitted
-            ):
-                filler = _pick_filler()
-                log.info("injecting tool-use filler: %r", filler)
-                async for sentence in _feed_text_into_buffer(
-                    filler + " ", buffer, state, start
+        async with stream_cm as stream:
+            async for event in stream:
+                event_type = getattr(event, "type", None)
+
+                # Server-side tool starting with zero preceding text → inject
+                # a covering sentence locally so the TTS has something to say
+                # during the search. Client-side tool starts do NOT trigger
+                # the filler (they execute instantly).
+                if (
+                    event_type == "content_block_start"
+                    and _is_filler_tool_start(event)
+                    and not any_text_emitted
                 ):
-                    any_text_emitted = True
-                    yield sentence
-                continue
-
-            # Text delta — normal streaming path
-            if event_type == "content_block_delta":
-                delta_obj = getattr(event, "delta", None)
-                if getattr(delta_obj, "type", None) == "text_delta":
-                    text = getattr(delta_obj, "text", "") or ""
-                    if not text:
-                        continue
+                    filler = _pick_filler()
+                    log.info("injecting tool-use filler: %r", filler)
                     async for sentence in _feed_text_into_buffer(
-                        text, buffer, state, start
+                        filler + " ", buffer, state, start
                     ):
                         any_text_emitted = True
                         yield sentence
+                    continue
+
+                # Text delta — normal streaming path
+                if event_type == "content_block_delta":
+                    delta_obj = getattr(event, "delta", None)
+                    if getattr(delta_obj, "type", None) == "text_delta":
+                        text = getattr(delta_obj, "text", "") or ""
+                        if not text:
+                            continue
+                        async for sentence in _feed_text_into_buffer(
+                            text, buffer, state, start
+                        ):
+                            any_text_emitted = True
+                            yield sentence
+
+            final_message = await _get_final_message(stream)
+
+        # Decide: are we done, or does a client-side tool need to run?
+        stop_reason = getattr(final_message, "stop_reason", None)
+        if stop_reason != "tool_use":
+            break  # end_turn, max_tokens, stop_sequence — we're done
+
+        # Walk content blocks: collect client-side tool_use blocks to
+        # execute. Ignore non-tool_use blocks (text, server_tool_use —
+        # those are already done at this point).
+        local_tool_uses: list[Any] = []
+        for block in getattr(final_message, "content", []) or []:
+            if getattr(block, "type", None) == "tool_use":
+                name = getattr(block, "name", None)
+                if name in LOCAL_TOOL_NAMES:
+                    local_tool_uses.append(block)
+
+        if not local_tool_uses:
+            # Claude asked for a client-side tool we don't know — break
+            # rather than hanging; log so we can diagnose.
+            log.warning(
+                "stop_reason=tool_use but no recognised local tool; breaking loop"
+            )
+            break
+
+        # Execute each tool and build tool_result blocks for the next request.
+        tool_result_blocks: list[dict[str, Any]] = []
+        for use in local_tool_uses:
+            tool_name = getattr(use, "name", "?")
+            tool_input = getattr(use, "input", {}) or {}
+            tool_use_id = getattr(use, "id", None)
+            if local_dispatcher is None:
+                result_text = "error: no local dispatcher configured"
+            else:
+                try:
+                    result_text = await local_dispatcher.execute(
+                        tool_name, tool_input, turn_id
+                    )
+                except Exception as exc:
+                    log.warning("local tool %s raised: %s", tool_name, exc)
+                    result_text = f"error: {exc}"
+            tool_result_blocks.append(
+                {
+                    "type": "tool_result",
+                    "tool_use_id": tool_use_id,
+                    "content": result_text,
+                }
+            )
+
+        # Echo the assistant message Claude just produced (full content,
+        # including any text and the tool_use blocks) and the tool_result
+        # user message so the next stream continues from the right place.
+        assistant_content = [
+            _content_block_as_dict(b)
+            for b in getattr(final_message, "content", []) or []
+        ]
+        api_messages.append({"role": "assistant", "content": assistant_content})
+        api_messages.append({"role": "user", "content": tool_result_blocks})
+
+        log.info(
+            "tool-use loop %d: executed %d local tool(s), continuing",
+            loop_index,
+            len(local_tool_uses),
+        )
+
+    else:
+        log.warning("stream_turn hit MAX_TOOL_USE_LOOPS (%d)", _MAX_TOOL_USE_LOOPS)
 
     # Flush any trailing text that never hit a boundary (rare but real)
     for sentence in buffer.flush():
@@ -352,22 +450,33 @@ async def stream_turn(
         state.boundary_misses = buffer.force_flush_count
         # Append the full assistant response to the session on clean completion
         session.append(Message(role="assistant", content=state.accumulated_text))
-    else:
-        # Caller didn't provide state; we still need to close the session cleanly.
-        # Rebuild assistant content from nothing — not ideal but only matters for
-        # tests that skip `state`. Production callers always pass one.
-        pass
+
+
+async def _get_final_message(stream: Any) -> Any:
+    """Get the accumulated message from the stream after iteration ends.
+
+    Real Anthropic streams expose `get_final_message()`. Test stubs may
+    set a plain `final_message` attribute instead. Both work.
+    """
+    if hasattr(stream, "get_final_message"):
+        return await stream.get_final_message()
+    return getattr(stream, "final_message", None)
 
 
 def _elapsed_ms(start: float) -> int:
     return int((time.perf_counter() - start) * 1000)
 
 
-def _is_tool_use_start(event: Any) -> bool:
-    """Return True if `event` is a `content_block_start` for a tool-use block."""
+def _is_filler_tool_start(event: Any) -> bool:
+    """Return True if the event announces a server-side tool starting.
+
+    Only server-side tools (web_search, web_fetch, code_execution) trigger
+    the covering-sentence filler; client-side tools (set_view, future
+    remember/recall) execute instantly and don't need one.
+    """
     block = getattr(event, "content_block", None)
     block_type = getattr(block, "type", None)
-    return block_type in _TOOL_USE_BLOCK_TYPES
+    return block_type in _FILLER_TOOL_BLOCK_TYPES
 
 
 def _pick_filler() -> str:
