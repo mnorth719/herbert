@@ -268,8 +268,9 @@ class Daemon:
     async def _run_llm_and_speak(self, turn: Turn) -> None:
         tts: TtsProvider = self._deps.tts
         audio_out: AudioOut = self._deps.hal.audio_out
+        bus = self._deps.bus
 
-        sentences = stream_turn(
+        raw_sentences = stream_turn(
             turn.transcript,
             self._session,
             self._deps.persona,
@@ -280,7 +281,22 @@ class Daemon:
             state=turn.llm_state,
         )
 
-        pcm_stream = tts.stream(sentences, state=turn.tts_state)
+        async def _broadcast_sentences() -> AsyncIterator[str]:
+            """Fork each LLM sentence to both the TTS stream and the event bus.
+
+            Without this the frontend transcript only shows the user turn;
+            the assistant text never reaches the UI. One event per sentence
+            keeps delta traffic bounded (vs. per-token).
+            """
+            async for sentence in raw_sentences:
+                # Trailing space keeps sentences visually separated in the UI
+                text = sentence if sentence.endswith(" ") else sentence + " "
+                await bus.publish(
+                    TranscriptDelta(turn_id=turn.turn_id, role="assistant", text=text)
+                )
+                yield sentence
+
+        pcm_stream = tts.stream(_broadcast_sentences(), state=turn.tts_state)
         state = self._state  # local alias for the inner closure
 
         async def _instrumented_pcm() -> AsyncIterator[bytes]:
