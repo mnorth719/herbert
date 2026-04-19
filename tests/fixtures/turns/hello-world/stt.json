@@ -1,0 +1,8 @@
+{
+  "text": "hello herbert",
+  "segments": [
+    { "start_ms": 0, "end_ms": 800, "text": "hello herbert" }
+  ],
+  "duration_ms": 620,
+  "_note": "Synthetic fixture — not the output of a real whisper run. Capture a real input.wav + run scripts/capture-fixture.py (Unit 7b) to replace."
+}
