@@ -49,12 +49,12 @@ VOICES: dict[str, list[dict[str, str | None]]] = {
         {
             "filename": "en_US-lessac-medium.onnx",
             "url": "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx",
-            "sha256": None,
+            "sha256": "5efe09e69902187827af646e1a6e9d269dee769f9877d17b16b1b46eeaaf019f",
         },
         {
             "filename": "en_US-lessac-medium.onnx.json",
             "url": "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx.json",
-            "sha256": None,
+            "sha256": "efe19c417bed055f2d69908248c6ba650fa135bc868b0e6abb3da181dab690a0",
         },
     ],
 }
