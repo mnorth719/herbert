@@ -459,7 +459,6 @@ async def build_and_run(
     from anthropic import AsyncAnthropic
 
     from herbert.hal import build_hal, detect_platform
-    from herbert.health import run_startup_checks
     from herbert.llm.mcp_passthrough import build_mcp_servers
     from herbert.secrets import ensure_frontend_bearer_token, load_secrets
     from herbert.stt.whisper_cpp import WhisperCppProvider
@@ -475,27 +474,15 @@ async def build_and_run(
     )
     secrets = load_secrets(config.secrets_path)
 
-    # Fire off health checks in the background. Each HTTP probe takes up
-    # to 3s and the audio probes another ~100ms — if we awaited the
-    # aggregate we'd add a couple of seconds to every boot. Log the
-    # results asynchronously instead so the user can start pressing the
-    # button the instant the daemon is wired.
-    async def _run_and_log_health() -> None:
-        checks = await run_startup_checks(
-            config, secrets, include_audio=platform != "mock"
-        )
-        for check in checks:
-            level = logging.INFO if check.ok else logging.WARNING
-            log.log(
-                level,
-                "health %s: %s (%dms) — %s",
-                check.name,
-                "ok" if check.ok else "FAIL",
-                check.duration_ms,
-                check.message,
-            )
-
-    asyncio.create_task(_run_and_log_health())  # noqa: RUF006 — fire-and-forget
+    # Health checks (herbert.health.run_startup_checks) are intentionally
+    # not run on boot. The HTTP probes contend with the first turn's
+    # Anthropic + ElevenLabs network calls, and the audio probes open
+    # real mic/speaker streams which can collide with the daemon's own
+    # capture/playback if the user presses the button early. The module
+    # still exists for future opt-in use via a `/healthz` diagnostic
+    # endpoint or a voice-triggered self-test; we just don't run it
+    # automatically. Truly fatal prerequisites (missing secrets) fail
+    # fast at the secrets layer, which happens above.
 
     anthropic_key = secrets.require("ANTHROPIC_API_KEY")
     import os as _os
