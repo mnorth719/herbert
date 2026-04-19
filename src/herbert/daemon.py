@@ -475,13 +475,27 @@ async def build_and_run(
     )
     secrets = load_secrets(config.secrets_path)
 
-    # Fire off health checks in parallel while the rest of wiring happens.
-    # Results are logged (and published on the bus) before daemon.run(); a
-    # failing check is diagnostic, not a boot blocker — the secrets fail-closed
-    # handles the truly fatal cases.
-    health_task = asyncio.create_task(
-        run_startup_checks(config, secrets, include_audio=platform != "mock")
-    )
+    # Fire off health checks in the background. Each HTTP probe takes up
+    # to 3s and the audio probes another ~100ms — if we awaited the
+    # aggregate we'd add a couple of seconds to every boot. Log the
+    # results asynchronously instead so the user can start pressing the
+    # button the instant the daemon is wired.
+    async def _run_and_log_health() -> None:
+        checks = await run_startup_checks(
+            config, secrets, include_audio=platform != "mock"
+        )
+        for check in checks:
+            level = logging.INFO if check.ok else logging.WARNING
+            log.log(
+                level,
+                "health %s: %s (%dms) — %s",
+                check.name,
+                "ok" if check.ok else "FAIL",
+                check.duration_ms,
+                check.message,
+            )
+
+    asyncio.create_task(_run_and_log_health())  # noqa: RUF006 — fire-and-forget
 
     anthropic_key = secrets.require("ANTHROPIC_API_KEY")
     import os as _os
@@ -554,24 +568,6 @@ async def build_and_run(
     daemon = Daemon(deps)
     # Capture the daemon reference so the health provider can read its state
     _daemon_ref["daemon"] = daemon
-
-    # Log the health-check summary before the event loop starts. Results
-    # are visible on the bus as LogLine events and on stderr; failing
-    # checks are diagnostic hints, not boot blockers.
-    try:
-        checks = await asyncio.wait_for(health_task, timeout=8.0)
-        for check in checks:
-            level = logging.INFO if check.ok else logging.WARNING
-            log.log(
-                level,
-                "health %s: %s (%dms) — %s",
-                check.name,
-                "ok" if check.ok else "FAIL",
-                check.duration_ms,
-                check.message,
-            )
-    except TimeoutError:
-        log.warning("startup health checks timed out after 8s")
 
     try:
         await daemon.run()
