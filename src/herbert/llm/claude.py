@@ -152,6 +152,7 @@ def _build_stream_kwargs(
     model: str,
     max_tokens: int,
     mcp_servers: list[dict[str, str]] | None,
+    tools: list[dict[str, Any]] | None,
 ) -> tuple[dict[str, Any], dict[str, str] | None]:
     """Split the call into (stream kwargs, extra headers). Beta header is opt-in."""
     kwargs: dict[str, Any] = {
@@ -160,6 +161,8 @@ def _build_stream_kwargs(
         "system": persona,
         "messages": [{"role": m.role, "content": m.content} for m in session.messages],
     }
+    if tools:
+        kwargs["tools"] = tools
     extra_headers: dict[str, str] | None = None
     if mcp_servers:
         kwargs["mcp_servers"] = mcp_servers
@@ -176,6 +179,7 @@ async def stream_turn(
     model: str = "claude-haiku-4-5",
     max_tokens: int = 1024,
     mcp_servers: list[dict[str, str]] | None = None,
+    tools: list[dict[str, Any]] | None = None,
     state: LlmTurnState | None = None,
     word_flush_threshold: int = 20,
 ) -> AsyncIterator[str]:
@@ -191,7 +195,7 @@ async def stream_turn(
     """
     session.append(Message(role="user", content=transcript))
     kwargs, extra_headers = _build_stream_kwargs(
-        session, persona, model, max_tokens, mcp_servers
+        session, persona, model, max_tokens, mcp_servers, tools
     )
     buffer = SentenceBuffer(word_flush_threshold=word_flush_threshold)
     start = time.perf_counter()

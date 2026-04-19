@@ -141,6 +141,23 @@ class TestTimingState:
         assert session.messages[-1].content == ""
 
 
+class TestToolsWiring:
+    async def test_no_tools_arg_omits_tools_kwarg(self) -> None:
+        session = InMemorySession()
+        client = _StubClient(["x. "])
+        async for _ in stream_turn("hi", session, "p", client=client):
+            pass
+        assert "tools" not in client.messages.last_kwargs
+
+    async def test_tools_passed_through_to_stream(self) -> None:
+        session = InMemorySession()
+        client = _StubClient(["x. "])
+        tools = [{"type": "web_search_20250305", "name": "web_search"}]
+        async for _ in stream_turn("hi", session, "p", client=client, tools=tools):
+            pass
+        assert client.messages.last_kwargs["tools"] == tools
+
+
 class TestMcpWiring:
     async def test_empty_mcp_servers_does_not_send_beta_header(self) -> None:
         session = InMemorySession()

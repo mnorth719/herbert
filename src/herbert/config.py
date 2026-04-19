@@ -37,6 +37,10 @@ class TtsConfig:
 class LlmConfig:
     model: str = "claude-haiku-4-5"
     max_tokens: int = 1024
+    # When True, pass Anthropic's server-side web_search tool to every turn.
+    # Adds 2-6s to any turn that actually searches; billed per search.
+    # No hard cap — Claude self-limits based on the question.
+    web_search_enabled: bool = True
 
 
 @dataclass

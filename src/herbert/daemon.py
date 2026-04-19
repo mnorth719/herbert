@@ -107,6 +107,7 @@ class DaemonDeps:
     llm_client: Any  # anthropic.AsyncAnthropic or a stub
     persona: str
     mcp_servers: list[dict[str, str]] | None = None
+    tools: list[dict[str, Any]] | None = None
     web_server: Any | None = None  # herbert.web.server.WebServer, set when CLI --expose or always-on
 
 
@@ -278,6 +279,7 @@ class Daemon:
             model=self._deps.config.llm.model,
             max_tokens=self._deps.config.llm.max_tokens,
             mcp_servers=self._deps.mcp_servers,
+            tools=self._deps.tools,
             state=turn.llm_state,
         )
 
@@ -409,6 +411,13 @@ async def build_and_run(
     web_server.start()
     log.info("web server listening on %s (expose=%s)", web_server.url, effective_expose)
 
+    from herbert.llm.tools import WEB_SEARCH_PERSONA_ADDENDUM, build_tools
+
+    tools = build_tools(web_search_enabled=config.llm.web_search_enabled)
+    persona = _load_persona(config.persona_path)
+    if config.llm.web_search_enabled:
+        persona = persona.rstrip() + WEB_SEARCH_PERSONA_ADDENDUM
+
     deps = DaemonDeps(
         config=config,
         bus=bus,
@@ -416,8 +425,9 @@ async def build_and_run(
         stt=stt,
         tts=tts,
         llm_client=llm_client,
-        persona=_load_persona(config.persona_path),
+        persona=persona,
         mcp_servers=build_mcp_servers(config.mcp) or None,
+        tools=tools or None,
         web_server=web_server,
     )
     daemon = Daemon(deps)
