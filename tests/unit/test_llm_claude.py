@@ -201,6 +201,39 @@ class TestToolsWiring:
             pass
         assert client.messages.last_kwargs["tools"] == tools
 
+    async def test_beta_headers_merged_and_comma_joined(self) -> None:
+        session = InMemorySession()
+        client = _StubClient(["x. "])
+        async for _ in stream_turn(
+            "hi",
+            session,
+            "p",
+            client=client,
+            beta_headers=["web-fetch-2025-09-10", "code-execution-2025-05-22"],
+        ):
+            pass
+        header = client.messages.last_kwargs["extra_headers"]["anthropic-beta"]
+        assert "web-fetch-2025-09-10" in header
+        assert "code-execution-2025-05-22" in header
+
+    async def test_beta_headers_and_mcp_header_combine(self) -> None:
+        session = InMemorySession()
+        client = _StubClient(["x. "])
+        mcp = [{"name": "demo", "url": "https://example.com/mcp"}]
+        async for _ in stream_turn(
+            "hi",
+            session,
+            "p",
+            client=client,
+            beta_headers=["code-execution-2025-05-22"],
+            mcp_servers=mcp,
+        ):
+            pass
+        header = client.messages.last_kwargs["extra_headers"]["anthropic-beta"]
+        # Both tool beta AND MCP beta must appear in the same header value
+        assert "code-execution-2025-05-22" in header
+        assert "mcp-client-2025-11-20" in header
+
 
 class TestMcpWiring:
     async def test_empty_mcp_servers_does_not_send_beta_header(self) -> None:

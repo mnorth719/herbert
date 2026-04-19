@@ -108,6 +108,7 @@ class DaemonDeps:
     persona: str
     mcp_servers: list[dict[str, str]] | None = None
     tools: list[dict[str, Any]] | None = None
+    beta_headers: list[str] | None = None
     web_server: Any | None = None  # herbert.web.server.WebServer, set when CLI --expose or always-on
 
 
@@ -280,6 +281,7 @@ class Daemon:
             max_tokens=self._deps.config.llm.max_tokens,
             mcp_servers=self._deps.mcp_servers,
             tools=self._deps.tools,
+            beta_headers=self._deps.beta_headers,
             state=turn.llm_state,
         )
 
@@ -411,12 +413,24 @@ async def build_and_run(
     web_server.start()
     log.info("web server listening on %s (expose=%s)", web_server.url, effective_expose)
 
-    from herbert.llm.tools import WEB_SEARCH_PERSONA_ADDENDUM, build_tools
+    from herbert.llm.tools import (
+        TOOLS_PERSONA_ADDENDUM,
+        build_tool_beta_headers,
+        build_tools,
+    )
 
-    tools = build_tools(web_search_enabled=config.llm.web_search_enabled)
+    tools = build_tools(
+        web_search_enabled=config.llm.web_search_enabled,
+        web_fetch_enabled=config.llm.web_fetch_enabled,
+        code_execution_enabled=config.llm.code_execution_enabled,
+    )
+    tool_betas = build_tool_beta_headers(
+        web_fetch_enabled=config.llm.web_fetch_enabled,
+        code_execution_enabled=config.llm.code_execution_enabled,
+    )
     persona = _load_persona(config.persona_path)
-    if config.llm.web_search_enabled:
-        persona = persona.rstrip() + WEB_SEARCH_PERSONA_ADDENDUM
+    if tools:
+        persona = persona.rstrip() + TOOLS_PERSONA_ADDENDUM
 
     deps = DaemonDeps(
         config=config,
@@ -428,6 +442,7 @@ async def build_and_run(
         persona=persona,
         mcp_servers=build_mcp_servers(config.mcp) or None,
         tools=tools or None,
+        beta_headers=tool_betas or None,
         web_server=web_server,
     )
     daemon = Daemon(deps)

@@ -236,8 +236,14 @@ def _build_stream_kwargs(
     max_tokens: int,
     mcp_servers: list[dict[str, str]] | None,
     tools: list[dict[str, Any]] | None,
+    beta_headers: list[str] | None,
 ) -> tuple[dict[str, Any], dict[str, str] | None]:
-    """Split the call into (stream kwargs, extra headers). Beta header is opt-in."""
+    """Split the call into (stream kwargs, extra headers).
+
+    The `anthropic-beta` header value is a comma-separated list of tokens.
+    We collect every token required by the active tools + MCP config into
+    one header so the caller doesn't have to juggle multiple headers.
+    """
     kwargs: dict[str, Any] = {
         "model": model,
         "max_tokens": max_tokens,
@@ -246,10 +252,14 @@ def _build_stream_kwargs(
     }
     if tools:
         kwargs["tools"] = tools
-    extra_headers: dict[str, str] | None = None
+    betas: list[str] = list(beta_headers or [])
     if mcp_servers:
         kwargs["mcp_servers"] = mcp_servers
-        extra_headers = {"anthropic-beta": MCP_BETA_HEADER}
+        if MCP_BETA_HEADER not in betas:
+            betas.append(MCP_BETA_HEADER)
+    extra_headers: dict[str, str] | None = None
+    if betas:
+        extra_headers = {"anthropic-beta": ",".join(betas)}
     return kwargs, extra_headers
 
 
@@ -263,6 +273,7 @@ async def stream_turn(
     max_tokens: int = 1024,
     mcp_servers: list[dict[str, str]] | None = None,
     tools: list[dict[str, Any]] | None = None,
+    beta_headers: list[str] | None = None,
     state: LlmTurnState | None = None,
     word_flush_threshold: int = 20,
 ) -> AsyncIterator[str]:
@@ -278,7 +289,7 @@ async def stream_turn(
     """
     session.append(Message(role="user", content=transcript))
     kwargs, extra_headers = _build_stream_kwargs(
-        session, persona, model, max_tokens, mcp_servers, tools
+        session, persona, model, max_tokens, mcp_servers, tools, beta_headers
     )
     buffer = SentenceBuffer(word_flush_threshold=word_flush_threshold)
     start = time.perf_counter()

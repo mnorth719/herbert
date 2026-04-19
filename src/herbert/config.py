@@ -37,10 +37,15 @@ class TtsConfig:
 class LlmConfig:
     model: str = "claude-haiku-4-5"
     max_tokens: int = 1024
-    # When True, pass Anthropic's server-side web_search tool to every turn.
-    # Adds 2-6s to any turn that actually searches; billed per search.
-    # No hard cap — Claude self-limits based on the question.
+    # Anthropic server-side tools. Each adds latency when it fires (2-6s
+    # for search/fetch, more for code execution) but transforms what
+    # Herbert can answer. Billed per invocation; Claude self-limits.
     web_search_enabled: bool = True
+    # Loads a specific URL and reads the page. Pairs with web_search:
+    # search returns a link, fetch gets the live content.
+    web_fetch_enabled: bool = True
+    # Python sandbox for calculations, API calls, date/time math.
+    code_execution_enabled: bool = True
 
 
 @dataclass
