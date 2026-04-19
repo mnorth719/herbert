@@ -53,7 +53,7 @@ class TestConfigPrecedence:
         assert isinstance(cfg, HerbertConfig)
         assert cfg.web.bind_host == "127.0.0.1"
         assert cfg.web.expose is False
-        assert cfg.llm.model == "claude-haiku-4-5"
+        assert cfg.llm.model == "claude-sonnet-4-6"
 
 
 class TestConfigDefaults:

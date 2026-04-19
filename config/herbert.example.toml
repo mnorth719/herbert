@@ -26,7 +26,7 @@ fallback_provider = "piper"
 # output_device_name = "USB Audio"
 
 [llm]
-model = "claude-haiku-4-5"
+model = "claude-sonnet-4-6"
 max_tokens = 1024
 
 [logging]

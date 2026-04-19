@@ -35,7 +35,11 @@ class TtsConfig:
 
 @dataclass
 class LlmConfig:
-    model: str = "claude-haiku-4-5"
+    # Sonnet is noticeably better at multi-step tool use and less prone
+    # to hallucinating when a tool returns unhelpful data. Haiku is
+    # faster but we're already paying 2-6s per tool call, so the
+    # marginal model latency costs less than a wrong answer.
+    model: str = "claude-sonnet-4-6"
     max_tokens: int = 1024
     # Anthropic server-side tools. Each adds latency when it fires (2-6s
     # for search/fetch, more for code execution) but transforms what

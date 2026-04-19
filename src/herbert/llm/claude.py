@@ -269,7 +269,7 @@ async def stream_turn(
     persona: str,
     client: LlmClientProtocol,
     *,
-    model: str = "claude-haiku-4-5",
+    model: str = "claude-sonnet-4-6",
     max_tokens: int = 1024,
     mcp_servers: list[dict[str, str]] | None = None,
     tools: list[dict[str, Any]] | None = None,
