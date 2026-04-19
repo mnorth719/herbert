@@ -23,8 +23,7 @@ MODELS: dict[str, dict[str, str | None]] = {
     "base.en-q5_1": {
         "filename": "ggml-base.en-q5_1.bin",
         "url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en-q5_1.bin",
-        # Pin after first verified download via `--trust-on-first-use`.
-        "sha256": None,
+        "sha256": "4baf70dd0d7c4247ba2b81fafd9c01005ac77c2f9ef064e00dcf195d0e2fdd2f",
     },
 }
 
