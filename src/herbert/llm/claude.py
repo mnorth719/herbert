@@ -57,18 +57,25 @@ log = logging.getLogger(__name__)
 
 _BOUNDARY_CHARS = frozenset(".!?;")
 
-# Canned covering sentences we inject when Claude skips ahead to a tool call.
+# Canned covering sentences we inject when Claude calls a search tool.
+#
 # Kept short so TTS lands the audio quickly and the user's ear has something
 # to latch onto during the 2-6s search. Each ends with a period so the
-# SentenceBuffer flushes immediately on feed().
+# SentenceBuffer flushes immediately on feed(). Voice: dry, retro-futurist,
+# cheerfully nerdy — same character Herbert speaks in the rest of the turn.
+# Light sprinkling of sci-fi / CS / D&D references; if any start feeling
+# stale after weeks of use, edit this tuple (no other code changes needed).
 _TOOL_USE_FILLERS: tuple[str, ...] = (
-    "Let me check.",
-    "One tick, looking that up.",
-    "Hold on a second.",
-    "Just a moment.",
-    "Let me see.",
-    "Consulting the network.",
-    "Hang on, going to pull that.",
+    "Spinning up the modem.",
+    "Let me grep the internet.",
+    "Rolling a wisdom check.",
+    "Pinging the hive mind.",
+    "Consulting the ship's computer.",
+    "One moment, phoning a friend.",
+    "Give me a cycle.",
+    "Blowing the dust off the encyclopedia.",
+    "Polling the ether.",
+    "Interrogating the oracle.",
 )
 
 # Tool-use content-block types we treat as "tool is starting". Both
