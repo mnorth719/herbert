@@ -912,6 +912,79 @@ async def build_and_run(
     # assignment is picked up by the endpoint at request time.
     web_server._snapshot_provider = _snapshot_provider  # type: ignore[attr-defined]
 
+    def _prompt_snapshot_provider() -> dict[str, Any]:
+        """Per-request view of the assembled system prompt + live session.
+
+        Mirrors the shape `build_system_prompt` produces but keeps the
+        sections structured (headers + per-section tokens + live msg list)
+        so the frontend can render them independently with collapsible
+        per-section controls.
+        """
+        from herbert.boot_snapshot import estimate_tokens
+
+        base = persona_cache.get_current()
+        tools_addendum = TOOLS_PERSONA_ADDENDUM if tools else None
+
+        if store is not None:
+            try:
+                facts = store.get_facts()
+                summaries_raw = store.get_recent_summaries(
+                    config.memory.recent_sessions_count
+                )
+            except Exception as exc:
+                log.warning("prompt snapshot memory read failed: %s", exc)
+                facts, summaries_raw = [], []
+        else:
+            facts, summaries_raw = [], []
+
+        live_messages: list[dict[str, str]] = []
+        sess = daemon.session
+        if sess is not None:
+            for msg in sess.messages:
+                live_messages.append({"role": msg.role, "content": msg.content})
+
+        # Render summaries with human dates for the UI. The daemon's
+        # memory.prompt module formats them the same way.
+        summaries_items = []
+        for summary, ended_at in summaries_raw:
+            import time as _time
+
+            label = _time.strftime("%a %b %-d", _time.localtime(ended_at))
+            summaries_items.append({"date": label, "summary": summary})
+
+        persona_tokens = estimate_tokens(base.rstrip())
+        tools_tokens = estimate_tokens(tools_addendum) if tools_addendum else 0
+        facts_text = "\n".join(f"- {f}" for f in facts) if facts else "(no facts)"
+        facts_tokens = estimate_tokens(facts_text)
+        summaries_text = (
+            "\n".join(f"- {s['date']}: {s['summary']}" for s in summaries_items)
+            if summaries_items
+            else "(no summaries)"
+        )
+        summaries_tokens = estimate_tokens(summaries_text)
+        live_text = "\n".join(f"{m['role']}: {m['content']}" for m in live_messages)
+        live_tokens = estimate_tokens(live_text) if live_text else 0
+
+        total = (
+            persona_tokens + tools_tokens + facts_tokens + summaries_tokens + live_tokens
+        )
+        return {
+            "persona": {"text": base.rstrip(), "tokens": persona_tokens},
+            "tools_addendum": (
+                {"text": tools_addendum, "tokens": tools_tokens}
+                if tools_addendum
+                else None
+            ),
+            "facts": {"items": facts, "tokens": facts_tokens},
+            "summaries": {"items": summaries_items, "tokens": summaries_tokens},
+            "live_messages": live_messages,
+            "live_messages_tokens": live_tokens,
+            "total_tokens": total,
+            "memory_enabled": store is not None,
+        }
+
+    web_server._prompt_snapshot_provider = _prompt_snapshot_provider  # type: ignore[attr-defined]
+
     # One-shot log at boot (captured in the file log regardless of WS
     # client state — greppable after the fact, doesn't depend on timing).
     log_snapshot(_snapshot_provider())
