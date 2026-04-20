@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from herbert.config import HerbertConfig, load_config
+from herbert.config import HerbertConfig, as_dict, load_config
 
 
 def write_toml(path: Path, body: str) -> Path:
@@ -91,3 +91,55 @@ class TestConfigOverride:
         path = write_toml(tmp_path / "h.toml", "garbage_key = 42\n")
         with pytest.raises(ValueError, match="unknown"):
             load_config(cli_path=path)
+
+
+class TestMemoryConfig:
+    """MemoryConfig defaults, overrides, and serialization."""
+
+    def test_memory_defaults(self) -> None:
+        cfg = HerbertConfig()
+        assert cfg.memory.enabled is True
+        assert cfg.memory.inactivity_seconds == 300
+        assert cfg.memory.recent_sessions_count == 5
+        # Default path should end with memory.db under ~/.herbert
+        assert cfg.memory.db_path.name == "memory.db"
+        assert cfg.memory.db_path.parent.name == ".herbert"
+
+    def test_toml_disables_memory(self, tmp_path: Path) -> None:
+        path = write_toml(tmp_path / "h.toml", "[memory]\nenabled = false\n")
+        cfg = load_config(cli_path=path)
+        assert cfg.memory.enabled is False
+        # Other defaults preserved
+        assert cfg.memory.inactivity_seconds == 300
+        assert cfg.memory.recent_sessions_count == 5
+
+    def test_toml_overrides_inactivity_seconds(self, tmp_path: Path) -> None:
+        path = write_toml(tmp_path / "h.toml", "[memory]\ninactivity_seconds = 600\n")
+        cfg = load_config(cli_path=path)
+        assert cfg.memory.inactivity_seconds == 600
+        assert cfg.memory.enabled is True  # unspecified keys keep defaults
+
+    def test_toml_overrides_db_path(self, tmp_path: Path) -> None:
+        target = tmp_path / "custom" / "memory.db"
+        path = write_toml(
+            tmp_path / "h.toml",
+            f'[memory]\ndb_path = "{target}"\n',
+        )
+        cfg = load_config(cli_path=path)
+        assert cfg.memory.db_path == target
+
+    def test_unknown_memory_key_rejected(self, tmp_path: Path) -> None:
+        path = write_toml(tmp_path / "h.toml", "[memory]\nbogus = 1\n")
+        with pytest.raises(ValueError, match="MemoryConfig"):
+            load_config(cli_path=path)
+
+    def test_as_dict_includes_memory(self) -> None:
+        cfg = HerbertConfig()
+        d = as_dict(cfg)
+        assert "memory" in d
+        assert d["memory"]["enabled"] is True
+        assert d["memory"]["inactivity_seconds"] == 300
+        assert d["memory"]["recent_sessions_count"] == 5
+        # db_path rendered as string (Path serialisation contract already in use elsewhere)
+        assert isinstance(d["memory"]["db_path"], str)
+        assert d["memory"]["db_path"].endswith("memory.db")

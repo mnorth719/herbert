@@ -181,6 +181,113 @@
         color: #c8d2db;
       }
       #diagnostic #diag-log-body { max-height: 400px; overflow-y: auto; }
+      #diagnostic .prompt-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        margin-bottom: 8px;
+      }
+      #diagnostic .prompt-header h3 { margin: 0; }
+      #diagnostic .prompt-header-right {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+      }
+      #diagnostic #diag-prompt-stamp {
+        color: #6a7a86;
+        font-size: 10px;
+        transition: opacity 200ms ease;
+      }
+      #diagnostic #diag-prompt-stamp.stale { opacity: 0.5; }
+      #diagnostic #diag-prompt-refresh {
+        background: #0d1318;
+        color: var(--accent);
+        border: 1px solid #1a2128;
+        padding: 3px 8px;
+        font-family: var(--mono);
+        font-size: 10px;
+        cursor: pointer;
+      }
+      #diagnostic #diag-prompt-refresh:hover { background: #14202a; }
+      #diagnostic .prompt-collapsible {
+        margin-bottom: 8px;
+        border-bottom: 1px dashed #1a2128;
+        padding-bottom: 8px;
+      }
+      #diagnostic .prompt-collapsible summary {
+        cursor: pointer;
+        color: var(--accent);
+        font-size: 10px;
+        letter-spacing: 0.5px;
+        text-transform: uppercase;
+      }
+      #diagnostic .prompt-collapsible pre {
+        margin: 8px 0 0;
+        white-space: pre-wrap;
+        word-break: break-word;
+        font-size: 11px;
+        line-height: 1.5;
+        color: #c8d2db;
+      }
+      #diagnostic .prompt-subsection {
+        margin-bottom: 10px;
+        padding-bottom: 8px;
+        border-bottom: 1px dashed #1a2128;
+      }
+      #diagnostic .prompt-subsection:last-of-type { border-bottom: none; }
+      #diagnostic .prompt-subheader {
+        color: #6a7a86;
+        text-transform: uppercase;
+        font-size: 9px;
+        letter-spacing: 1px;
+        margin-bottom: 5px;
+      }
+      #diagnostic .prompt-bullet-list {
+        margin: 0; padding-left: 16px;
+        color: #c8d2db;
+        font-size: 11px;
+        line-height: 1.5;
+      }
+      #diagnostic .prompt-summary-list {
+        margin: 0;
+        font-size: 11px;
+        line-height: 1.5;
+      }
+      #diagnostic .prompt-summary-list dt {
+        color: #6a7a86;
+        font-size: 9px;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+      }
+      #diagnostic .prompt-summary-list dd {
+        margin: 0 0 6px 0;
+        color: #c8d2db;
+      }
+      #diagnostic .prompt-live-messages {
+        margin: 0; padding-left: 20px;
+        max-height: 240px; overflow-y: auto;
+        font-size: 11px;
+        line-height: 1.5;
+      }
+      #diagnostic .prompt-live-messages li { margin-bottom: 6px; }
+      #diagnostic .live-msg-role {
+        display: inline-block;
+        text-transform: uppercase;
+        font-size: 9px;
+        letter-spacing: 1px;
+        margin-right: 6px;
+      }
+      #diagnostic .live-msg.role-user .live-msg-role { color: #9aa8b4; }
+      #diagnostic .live-msg.role-assistant .live-msg-role { color: var(--accent); }
+      #diagnostic .live-msg-content { color: #c8d2db; white-space: pre-wrap; word-break: break-word; }
+      #diagnostic .prompt-empty { color: #6a7a86; font-style: italic; font-size: 11px; }
+      #diagnostic .prompt-error { color: var(--warn); font-size: 11px; }
+      #diagnostic .prompt-total {
+        margin-top: 8px;
+        color: var(--accent);
+        font-size: 11px;
+        text-align: right;
+      }
       #diagnostic .error-banner {
         position: sticky;
         top: 0;

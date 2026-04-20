@@ -68,6 +68,11 @@ from herbert.turn import Turn
 log = logging.getLogger(__name__)
 
 
+def _estimate_tokens_for_message(msg: Message) -> int:
+    """Cheap heuristic shared with boot_snapshot.estimate_tokens."""
+    return max(1, len(msg.content) // 4)
+
+
 # Default system prompt used when no persona file exists on disk.
 # Also imported by scripts/demo-voice.py so the fallback is in one place.
 #
@@ -106,6 +111,10 @@ class DaemonDeps:
     that returns the current persona text (production path, backed by
     `PersonaCache` for hot-reload). The daemon resolves it per turn and
     appends `TOOLS_PERSONA_ADDENDUM` when tools are active.
+
+    `store` and `session_factory` wire in persistent memory. When `store`
+    is None (memory disabled), the daemon falls back to `InMemorySession`
+    and no inactivity timer / extraction task runs.
     """
 
     config: HerbertConfig
@@ -119,6 +128,11 @@ class DaemonDeps:
     tools: list[dict[str, Any]] | None = None
     beta_headers: list[str] | None = None
     web_server: Any | None = None  # herbert.web.server.WebServer, set when CLI --expose or always-on
+    # Memory wiring. `store` owns the SQLite DB + writer thread. `session_factory`
+    # is called on first PressStarted to allocate a new SqliteSession (lazy so
+    # boot doesn't create empty `sessions` rows).
+    store: Any | None = None  # herbert.memory.MemoryStore
+    session_factory: Callable[[], Session] | None = None
 
 
 class Daemon:
@@ -127,13 +141,30 @@ class Daemon:
     def __init__(self, deps: DaemonDeps, session: Session | None = None) -> None:
         self._deps = deps
         self._state = StateMachine(deps.bus)
-        self._session: Session = session or InMemorySession()
+        # Session allocation rules:
+        #  - If the caller hands us an explicit `session` (tests do this),
+        #    use it.
+        #  - Else if a `session_factory` is wired in (production w/ memory),
+        #    defer allocation to first PressStarted — `_session` stays None
+        #    until a button press so boot doesn't create empty DB rows.
+        #  - Else default to a fresh InMemorySession (memory disabled path
+        #    and older test constructors).
+        self._session: Session | None
+        if session is not None:
+            self._session = session
+        elif deps.session_factory is not None:
+            self._session = None
+        else:
+            self._session = InMemorySession()
         self._current_turn: Turn | None = None
         self._current_task: asyncio.Task[None] | None = None
         self._stopping = asyncio.Event()
         self._bus_forward_task: asyncio.Task[None] | None = None
         self._recovery_task: asyncio.Task[None] | None = None
         self._transcript_log_task: asyncio.Task[None] | None = None
+        # Memory lifecycle tasks — only active when a store is wired in.
+        self._inactivity_task: asyncio.Task[None] | None = None
+        self._extraction_tasks: set[asyncio.Task[None]] = set()
         # Mode label that shows up on every TurnStarted / ExchangeLatency
         # event. Used by the R6 ceiling lookup in `TurnSpan.evaluate_ceilings`.
         self._mode = "pi_hybrid" if deps.hal.platform == "pi" else "mac_hybrid"
@@ -151,7 +182,7 @@ class Daemon:
         return self._state.state
 
     @property
-    def session(self) -> Session:
+    def session(self) -> Session | None:
         return self._session
 
     async def run(self) -> None:
@@ -195,6 +226,27 @@ class Daemon:
                     await self._transcript_log_task
                 except asyncio.CancelledError:
                     pass
+            if self._inactivity_task is not None and not self._inactivity_task.done():
+                self._inactivity_task.cancel()
+                try:
+                    await self._inactivity_task
+                except asyncio.CancelledError:
+                    pass
+            # Give in-flight extraction tasks a brief chance to finish so
+            # closing summaries/facts land before shutdown. Cancel any that
+            # don't drain within the window — they'll just leave the
+            # session un-summarised, which `get_recent_summaries` already
+            # filters out.
+            if self._extraction_tasks:
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*self._extraction_tasks, return_exceptions=True),
+                        timeout=2.0,
+                    )
+                except TimeoutError:
+                    for t in list(self._extraction_tasks):
+                        if not t.done():
+                            t.cancel()
             await source.close()
 
     async def _log_transcripts(self) -> None:
@@ -243,11 +295,21 @@ class Daemon:
         # concurrent paths out of the error state.
         if self._recovery_task is not None and not self._recovery_task.done():
             self._recovery_task.cancel()
+        # Memory-enabled daemons defer session allocation to first press;
+        # materialise here so `_run_turn` + cancel reconciliation can rely
+        # on `_session` being non-None.
+        self._ensure_session()
+        self._reset_inactivity_timer()
         turn = Turn()
         self._current_turn = turn
         await self._state.transition("listening", turn_id=turn.turn_id)
         await self._deps.bus.publish(TurnStarted(turn_id=turn.turn_id, mode=self._mode))
         self._current_task = asyncio.create_task(self._run_turn(turn))
+
+    def _ensure_session(self) -> None:
+        """Allocate a session via the factory if one isn't live yet."""
+        if self._session is None and self._deps.session_factory is not None:
+            self._session = self._deps.session_factory()
 
     def _on_press_ended(self) -> None:
         if self._current_turn is not None:
@@ -279,6 +341,10 @@ class Daemon:
           user's (assistant append never happened), replace the prior
           user-only state with (user, interrupted-assistant) pair.
         """
+        if self._session is None:
+            # Session was cleared (e.g., inactivity close fired between
+            # press + reconcile). Nothing to roll back.
+            return
         if not turn.llm_state.tokens_received:
             last = self._session.messages[-1] if self._session.messages else None
             if last is not None and last.role == "user" and last.content == turn.transcript:
@@ -334,22 +400,56 @@ class Daemon:
         turn.span.record("stt", result.duration_ms)
         return result.text
 
-    def _resolve_persona(self) -> str:
-        """Resolve the persona string for this turn.
+    def _resolve_persona(self, turn: Turn | None = None) -> str:
+        """Resolve the persona string for this turn, including memory sections.
 
         `DaemonDeps.persona` may be a static string (tests) or a callable
         (production PersonaCache). We fetch fresh text per turn so mid-
         session edits to `~/.herbert/persona.md` take effect next turn.
-        `TOOLS_PERSONA_ADDENDUM` is appended when tools are active so the
-        addendum text isn't baked into cache and doesn't get duplicated.
+        `TOOLS_PERSONA_ADDENDUM` is appended when tools are active.
+
+        When a memory store is wired in, the facts + recent-session
+        summaries are assembled via `build_system_prompt` and appended
+        after the tools addendum. The per-section token breakdown is
+        attached to `turn.prompt_breakdown` for the log line.
         """
         from herbert.llm.tools import TOOLS_PERSONA_ADDENDUM
 
         source = self._deps.persona
         base = source() if callable(source) else source
-        if self._deps.tools:
-            return base.rstrip() + TOOLS_PERSONA_ADDENDUM
-        return base
+        tools_addendum = TOOLS_PERSONA_ADDENDUM if self._deps.tools else None
+
+        store = self._deps.store
+        if store is None:
+            # No memory — preserve the pre-memory string shape exactly.
+            if tools_addendum:
+                return base.rstrip() + tools_addendum
+            return base
+
+        from herbert.memory import build_system_prompt
+
+        try:
+            facts = store.get_facts()
+            summaries = store.get_recent_summaries(
+                self._deps.config.memory.recent_sessions_count
+            )
+        except Exception as exc:
+            # Memory read failed — fall back to the non-memory shape so a
+            # transient DB glitch doesn't brick this turn.
+            log.warning("memory read failed on turn persona; falling back: %s", exc)
+            if tools_addendum:
+                return base.rstrip() + tools_addendum
+            return base
+
+        prompt, breakdown = build_system_prompt(
+            persona=base,
+            tools_addendum=tools_addendum,
+            facts=facts,
+            summaries=summaries,
+        )
+        if turn is not None:
+            turn.prompt_breakdown = breakdown
+        return prompt
 
 
     async def _run_llm_and_speak(self, turn: Turn) -> None:
@@ -357,10 +457,11 @@ class Daemon:
         audio_out: AudioOut = self._deps.hal.audio_out
         bus = self._deps.bus
 
+        assert self._session is not None, "session must be allocated before _run_turn"
         raw_sentences = stream_turn(
             turn.transcript,
             self._session,
-            self._resolve_persona(),
+            self._resolve_persona(turn),
             client=self._deps.llm_client,
             model=self._deps.config.llm.model,
             max_tokens=self._deps.config.llm.max_tokens,
@@ -465,6 +566,127 @@ class Daemon:
         await self._deps.bus.publish(
             TurnCompleted(turn_id=turn.turn_id, outcome=outcome)  # type: ignore[arg-type]
         )
+        # Log the per-turn prompt breakdown when memory is active so drift
+        # is greppable in the file log. Direct call (not bus-subscribe) so
+        # it lands synchronously with completion.
+        self._log_prompt_turn(turn)
+        # Reset the inactivity timer inline here. Bus-subscribe would
+        # introduce an async handoff with `_on_press_started` and break
+        # the ordering invariant that "each press gets a full 5 min."
+        self._reset_inactivity_timer()
+
+    def _log_prompt_turn(self, turn: Turn) -> None:
+        breakdown = getattr(turn, "prompt_breakdown", None)
+        if breakdown is None:
+            return
+        live_tokens = sum(
+            _estimate_tokens_for_message(m) for m in (self._session.messages if self._session else [])
+        )
+        log.info(
+            "prompt.turn turn=%s persona=%d tools=%d facts=%d summaries=%d live=%d total=%d",
+            turn.turn_id,
+            breakdown.get("persona", 0),
+            breakdown.get("tools", 0),
+            breakdown.get("facts", 0),
+            breakdown.get("summaries", 0),
+            live_tokens,
+            breakdown.get("total", 0) + live_tokens,
+        )
+
+    def _reset_inactivity_timer(self) -> None:
+        """Cancel any pending inactivity task and start a fresh one.
+
+        No-op when memory is disabled (no store wired in) — there's nothing
+        to close in that case.
+        """
+        if self._deps.store is None:
+            return
+        if self._inactivity_task is not None and not self._inactivity_task.done():
+            self._inactivity_task.cancel()
+        self._inactivity_task = asyncio.create_task(self._monitor_inactivity())
+
+    async def _monitor_inactivity(self) -> None:
+        """Wait `config.memory.inactivity_seconds`, then close the session."""
+        delay = float(self._deps.config.memory.inactivity_seconds)
+        try:
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            return
+        # Only close if we're genuinely idle and no turn task is live.
+        if self._state.state != "idle":
+            return
+        if self._current_task is not None and not self._current_task.done():
+            return
+        await self._close_current_session()
+
+    async def _close_current_session(self) -> None:
+        """Seal the current session, schedule extraction, and reset state.
+
+        Safe to call repeatedly — bails if there's no live session.
+        """
+        session = self._session
+        store = self._deps.store
+        if session is None or store is None:
+            return
+        session_id = getattr(session, "session_id", None)
+        if session_id is None:
+            # InMemorySession has no session_id — nothing to persist.
+            self._session = None
+            return
+
+        # Snapshot the turns + existing facts at close time so the
+        # background extraction task has deterministic inputs and isn't
+        # racing against a potential new session starting.
+        turns_snapshot = store.get_session_turns(session_id)
+        existing_facts = store.get_facts()
+
+        # Seal immediately. Even if extraction fails, the session is
+        # visibly closed — `get_recent_summaries` filters to non-null
+        # summary so a half-closed session contributes nothing.
+        store.close_session(session_id, summary=None, new_facts=[])
+        log.info("session %s sealed (turns=%d)", session_id, len(turns_snapshot))
+
+        # Schedule extraction as a tracked background task. Non-blocking.
+        task = asyncio.create_task(
+            self._run_extraction(session_id, turns_snapshot, existing_facts)
+        )
+        self._extraction_tasks.add(task)
+        task.add_done_callback(self._extraction_tasks.discard)
+
+        # Clear the live session; next PressStarted allocates a new one
+        # via the factory.
+        self._session = None
+
+    async def _run_extraction(
+        self,
+        session_id: str,
+        turns: list[tuple[str, str]],
+        existing_facts: list[str],
+    ) -> None:
+        """Background extraction task. Never raises — errors log and drop."""
+        from herbert.memory import extract_session_summary
+
+        try:
+            summary, new_facts = await extract_session_summary(
+                client=self._deps.llm_client,
+                model=self._deps.config.llm.model,
+                turns=turns,
+                existing_facts=existing_facts,
+            )
+        except Exception as exc:
+            log.warning("extraction task crashed for session %s: %s", session_id, exc)
+            return
+        if summary is None and not new_facts:
+            return
+        store = self._deps.store
+        if store is not None:
+            store.close_session(session_id, summary=summary, new_facts=new_facts)
+            log.info(
+                "session %s enriched: summary=%s new_facts=%d",
+                session_id,
+                "yes" if summary else "no",
+                len(new_facts),
+            )
 
     async def _finalize_and_publish_latency(self, turn: Turn, turn_start: float) -> None:
         """Finalize TurnSpan, emit LatencyMiss per missed stage, ExchangeLatency total.
@@ -600,6 +822,25 @@ async def build_and_run(
     persona_cache = PersonaCache(config.persona_path, default=DEFAULT_PERSONA)
     persona_cache.prime_at_startup()
 
+    # Memory wiring. When enabled, MemoryStore owns the DB connections +
+    # writer thread; session_factory allocates a new SqliteSession on each
+    # first-press-after-close. When disabled, both stay None and the
+    # Daemon falls back to a plain InMemorySession per its own default.
+    store = None
+    session_factory = None
+    if config.memory.enabled:
+        from herbert.memory import MemoryStore
+        from herbert.session import SqliteSession
+
+        store = MemoryStore(config.memory.db_path)
+        log.info("memory enabled at %s", config.memory.db_path)
+
+        def _factory() -> Session:
+            assert store is not None  # mypy — captured non-None via closure
+            return SqliteSession(store, store.start_session())
+
+        session_factory = _factory
+
     deps = DaemonDeps(
         config=config,
         bus=bus,
@@ -612,6 +853,8 @@ async def build_and_run(
         tools=tools or None,
         beta_headers=tool_betas or None,
         web_server=web_server,
+        store=store,
+        session_factory=session_factory,
     )
     daemon = Daemon(deps)
     # Capture the daemon reference so the health provider can read its state
@@ -630,9 +873,27 @@ async def build_and_run(
     )
 
     def _snapshot_provider() -> dict[str, Any]:
-        assembled = persona_cache.get_current()
-        if tools:
-            assembled = assembled.rstrip() + TOOLS_PERSONA_ADDENDUM
+        base = persona_cache.get_current()
+        tools_addendum = TOOLS_PERSONA_ADDENDUM if tools else None
+        if store is not None:
+            from herbert.memory import build_system_prompt
+
+            try:
+                facts = store.get_facts()
+                summaries = store.get_recent_summaries(
+                    config.memory.recent_sessions_count
+                )
+            except Exception as exc:
+                log.warning("snapshot memory read failed: %s", exc)
+                facts, summaries = [], []
+            assembled, _ = build_system_prompt(
+                persona=base,
+                tools_addendum=tools_addendum,
+                facts=facts,
+                summaries=summaries,
+            )
+        else:
+            assembled = base.rstrip() + (tools_addendum or "")
         return build_snapshot(
             config=config,
             platform=platform,
@@ -650,6 +911,79 @@ async def build_and_run(
     # works. WebServer was built earlier without it; the attribute
     # assignment is picked up by the endpoint at request time.
     web_server._snapshot_provider = _snapshot_provider  # type: ignore[attr-defined]
+
+    def _prompt_snapshot_provider() -> dict[str, Any]:
+        """Per-request view of the assembled system prompt + live session.
+
+        Mirrors the shape `build_system_prompt` produces but keeps the
+        sections structured (headers + per-section tokens + live msg list)
+        so the frontend can render them independently with collapsible
+        per-section controls.
+        """
+        from herbert.boot_snapshot import estimate_tokens
+
+        base = persona_cache.get_current()
+        tools_addendum = TOOLS_PERSONA_ADDENDUM if tools else None
+
+        if store is not None:
+            try:
+                facts = store.get_facts()
+                summaries_raw = store.get_recent_summaries(
+                    config.memory.recent_sessions_count
+                )
+            except Exception as exc:
+                log.warning("prompt snapshot memory read failed: %s", exc)
+                facts, summaries_raw = [], []
+        else:
+            facts, summaries_raw = [], []
+
+        live_messages: list[dict[str, str]] = []
+        sess = daemon.session
+        if sess is not None:
+            for msg in sess.messages:
+                live_messages.append({"role": msg.role, "content": msg.content})
+
+        # Render summaries with human dates for the UI. The daemon's
+        # memory.prompt module formats them the same way.
+        summaries_items = []
+        for summary, ended_at in summaries_raw:
+            import time as _time
+
+            label = _time.strftime("%a %b %-d", _time.localtime(ended_at))
+            summaries_items.append({"date": label, "summary": summary})
+
+        persona_tokens = estimate_tokens(base.rstrip())
+        tools_tokens = estimate_tokens(tools_addendum) if tools_addendum else 0
+        facts_text = "\n".join(f"- {f}" for f in facts) if facts else "(no facts)"
+        facts_tokens = estimate_tokens(facts_text)
+        summaries_text = (
+            "\n".join(f"- {s['date']}: {s['summary']}" for s in summaries_items)
+            if summaries_items
+            else "(no summaries)"
+        )
+        summaries_tokens = estimate_tokens(summaries_text)
+        live_text = "\n".join(f"{m['role']}: {m['content']}" for m in live_messages)
+        live_tokens = estimate_tokens(live_text) if live_text else 0
+
+        total = (
+            persona_tokens + tools_tokens + facts_tokens + summaries_tokens + live_tokens
+        )
+        return {
+            "persona": {"text": base.rstrip(), "tokens": persona_tokens},
+            "tools_addendum": (
+                {"text": tools_addendum, "tokens": tools_tokens}
+                if tools_addendum
+                else None
+            ),
+            "facts": {"items": facts, "tokens": facts_tokens},
+            "summaries": {"items": summaries_items, "tokens": summaries_tokens},
+            "live_messages": live_messages,
+            "live_messages_tokens": live_tokens,
+            "total_tokens": total,
+            "memory_enabled": store is not None,
+        }
+
+    web_server._prompt_snapshot_provider = _prompt_snapshot_provider  # type: ignore[attr-defined]
 
     # One-shot log at boot (captured in the file log regardless of WS
     # client state — greppable after the fact, doesn't depend on timing).
@@ -675,6 +1009,8 @@ async def build_and_run(
         await daemon.run()
     finally:
         web_server.stop()
+        if store is not None:
+            store.close()
     return 0
 
 

@@ -33,15 +33,17 @@ def create_app(
     broadcaster: Broadcaster,
     health_provider,  # type: ignore[no-untyped-def]
     snapshot_accessor=None,  # type: ignore[no-untyped-def]
+    prompt_snapshot_accessor=None,  # type: ignore[no-untyped-def]
     static_dir: Path = STATIC_DIR,
 ) -> FastAPI:
     """Build the FastAPI instance. Dependencies are injected by the server factory.
 
-    `snapshot_accessor` is a zero-arg callable that returns the current
-    snapshot provider (another callable) — or None if not yet configured.
-    This double-indirection lets the daemon register/replace the provider
-    *after* the web thread has started. /api/boot_snapshot reads through
-    it on every request, so persona hot-reloads show up immediately.
+    `snapshot_accessor` returns the boot-snapshot provider (config +
+    assembled prompt). `prompt_snapshot_accessor` returns a separate
+    provider focused on the per-request prompt view — structured per
+    section, including live session messages. Both use the same
+    double-indirection pattern so the daemon can register them after
+    the web thread has started; endpoints return 503 until they're set.
     """
     app = FastAPI(
         title="Herbert",
@@ -68,6 +70,21 @@ def create_app(
             return JSONResponse(provider())
         except Exception as exc:
             log.warning("boot snapshot provider raised: %s", exc)
+            return JSONResponse({"error": str(exc)}, status_code=500)
+
+    @app.get("/api/prompt/snapshot")
+    async def prompt_snapshot(_auth: None = Depends(http_auth)) -> JSONResponse:
+        accessor = prompt_snapshot_accessor
+        provider = accessor() if accessor is not None else None
+        if provider is None:
+            return JSONResponse(
+                {"error": "snapshot provider not yet configured"},
+                status_code=503,
+            )
+        try:
+            return JSONResponse(provider())
+        except Exception as exc:
+            log.warning("prompt snapshot provider raised: %s", exc)
             return JSONResponse({"error": str(exc)}, status_code=500)
 
     @app.websocket("/ws")

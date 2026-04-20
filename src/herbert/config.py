@@ -64,6 +64,28 @@ class McpConfig:
 
 
 @dataclass
+class MemoryConfig:
+    # Master switch. When False the daemon uses InMemorySession and no DB is
+    # opened — this is the pre-memory behaviour Herbert shipped with through M3.
+    enabled: bool = True
+    # Single SQLite file. Parent dir is created on demand.
+    db_path: Path = field(default_factory=lambda: Path.home() / ".herbert" / "memory.db")
+    # A session closes after this many seconds of no button activity. The
+    # second extraction Claude call fires on close; a new session_id is
+    # allocated on the next press.
+    inactivity_seconds: int = 300
+    # How many prior session summaries to surface in the always-loaded "##
+    # Recent sessions" block of the system prompt.
+    recent_sessions_count: int = 5
+
+    def __post_init__(self) -> None:
+        # TOML feeds strings; the rest of the codebase expects Path. Coerce
+        # once here so callers never have to check.
+        if not isinstance(self.db_path, Path):
+            self.db_path = Path(self.db_path)
+
+
+@dataclass
 class HerbertConfig:
     persona_path: Path = field(default_factory=lambda: Path.home() / ".herbert" / "persona.md")
     secrets_path: Path = field(default_factory=lambda: Path.home() / ".herbert" / "secrets.env")
@@ -74,9 +96,10 @@ class HerbertConfig:
     llm: LlmConfig = field(default_factory=LlmConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     mcp: McpConfig = field(default_factory=McpConfig)
+    memory: MemoryConfig = field(default_factory=MemoryConfig)
 
 
-_TOP_LEVEL_SECTIONS = {"web", "stt", "tts", "llm", "logging", "mcp"}
+_TOP_LEVEL_SECTIONS = {"web", "stt", "tts", "llm", "logging", "mcp", "memory"}
 _TOP_LEVEL_SCALARS = {"persona_path", "secrets_path", "log_path"}
 
 
@@ -114,6 +137,7 @@ def _build_config(data: dict[str, Any]) -> HerbertConfig:
         "llm": LlmConfig,
         "logging": LoggingConfig,
         "mcp": McpConfig,
+        "memory": MemoryConfig,
     }
     for section, cls in section_map.items():
         if section in data:
@@ -142,9 +166,20 @@ def as_dict(cfg: HerbertConfig) -> dict[str, Any]:
     for f in fields(cfg):
         value = getattr(cfg, f.name)
         if is_dataclass(value) and not isinstance(value, type):
-            out[f.name] = asdict(value)
+            out[f.name] = _stringify_paths(asdict(value))
         elif isinstance(value, Path):
             out[f.name] = str(value)
         else:
             out[f.name] = value
     return out
+
+
+def _stringify_paths(data: Any) -> Any:
+    """Recursively convert Path instances inside a dict/list tree to str."""
+    if isinstance(data, Path):
+        return str(data)
+    if isinstance(data, dict):
+        return {k: _stringify_paths(v) for k, v in data.items()}
+    if isinstance(data, list):
+        return [_stringify_paths(v) for v in data]
+    return data

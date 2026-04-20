@@ -52,6 +52,11 @@ class WebServer:
         # finishes wiring up persona + tools so /api/boot_snapshot can
         # return current state. Until set, the endpoint returns 503.
         self._snapshot_provider: Callable[[], dict[str, Any]] | None = None
+        # Parallel late-bound provider for /api/prompt/snapshot. Same
+        # double-indirection pattern: daemon registers it after wiring
+        # memory + session factory; the endpoint reads through
+        # `prompt_snapshot_accessor` at request time.
+        self._prompt_snapshot_provider: Callable[[], dict[str, Any]] | None = None
         self._queue: janus.Queue[BaseModel] | None = None
         self._broadcaster: Broadcaster | None = None
         self._server: uvicorn.Server | None = None
@@ -124,6 +129,7 @@ class WebServer:
             broadcaster=self._broadcaster,
             health_provider=self._health_provider,
             snapshot_accessor=lambda: self._snapshot_provider,
+            prompt_snapshot_accessor=lambda: self._prompt_snapshot_provider,
         )
         config = uvicorn.Config(
             app,
