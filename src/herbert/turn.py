@@ -100,6 +100,10 @@ class Turn:
     llm_state: LlmTurnState = field(default_factory=LlmTurnState)
     tts_state: TtsState = field(default_factory=TtsState)
     transcript: str = ""
+    # Populated by Daemon._resolve_persona on each turn — per-section
+    # token estimates for the assembled system prompt. Consumed by the
+    # per-turn `prompt.turn` log line.
+    prompt_breakdown: dict[str, int] | None = None
 
     def __post_init__(self) -> None:
         self.span = TurnSpan(turn_id=self.turn_id)

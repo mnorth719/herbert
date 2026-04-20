@@ -126,14 +126,19 @@ class MemoryStore:
     def get_session_turns(self, session_id: str) -> list[tuple[str, str]]:
         """Return ``(role, content)`` pairs for a session, oldest first.
 
+        Ordering is by SQLite's implicit ``rowid`` (insertion order).
+        ``ts`` granularity is 1 second and two turns often land inside
+        the same second; ULIDs aren't guaranteed monotonic within a
+        second either. ``rowid`` is the only column that preserves the
+        exact order ``append_turn`` was called.
+
         Returning plain tuples (rather than ``Message`` objects from
-        ``herbert.session``) keeps this module free of a circular import
-        — the session module will come to depend on memory in Unit 6.
+        ``herbert.session``) keeps this module free of a circular import.
         """
         with self._reader_lock:
             rows = self._reader_conn.execute(
                 "SELECT role, content FROM messages "
-                "WHERE session_id=? ORDER BY ts ASC, turn_id ASC",
+                "WHERE session_id=? ORDER BY rowid ASC",
                 (session_id,),
             ).fetchall()
         return [(r[0], r[1]) for r in rows]
